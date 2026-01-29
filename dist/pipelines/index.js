@@ -19,6 +19,8 @@ export { AutomaticSpeechRecognitionPipeline, createASRPipeline, } from './automa
 export { ZeroShotClassificationPipeline, createZeroShotClassificationPipeline, } from './zero-shot-classification.js';
 // Question Answering
 export { QuestionAnsweringPipeline, createQuestionAnsweringPipeline, } from './question-answering.js';
+// Image Segmentation
+export { ImageSegmentationPipeline, createImageSegmentationPipeline, } from './image-segmentation.js';
 // Import pipeline classes
 import { TextClassificationPipeline, SentimentAnalysisPipeline } from './text-classification.js';
 import { FeatureExtractionPipeline } from './feature-extraction.js';
@@ -28,6 +30,7 @@ import { ObjectDetectionPipeline } from './object-detection.js';
 import { AutomaticSpeechRecognitionPipeline } from './automatic-speech-recognition.js';
 import { ZeroShotClassificationPipeline } from './zero-shot-classification.js';
 import { QuestionAnsweringPipeline } from './question-answering.js';
+import { ImageSegmentationPipeline } from './image-segmentation.js';
 /**
  * Create a pipeline for a specific task
  *
@@ -79,6 +82,9 @@ export async function pipeline(task, options) {
             break;
         case 'question-answering':
             pipelineInstance = new QuestionAnsweringPipeline(config);
+            break;
+        case 'image-segmentation':
+            pipelineInstance = new ImageSegmentationPipeline(config);
             break;
         default:
             throw new Error(`Unknown pipeline task: ${task}`);

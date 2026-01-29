@@ -61,7 +61,95 @@
       </div>
     </div>
 
-    <!-- Row 2: Core Operations -->
+    <!-- Row 2: Advanced AI Features -->
+    <div class="bento-grid">
+      <!-- SAM Interactive Segmentation -->
+      <div class="bento-card span-6">
+        <div class="card-header">
+          <div class="card-icon pink">✂️</div>
+          <div>
+            <div class="card-title">Interactive Segmentation</div>
+            <div class="card-desc">Click to segment objects - powered by SAM (~14MB)</div>
+          </div>
+        </div>
+        <!-- SAM Loading State -->
+        <div class="model-loader" id="sam-loader">
+          <div class="loader-content">
+            <div class="loader-spinner"></div>
+            <div class="loader-text" id="sam-loader-text">Loading SAM model...</div>
+            <div class="progress-bar">
+              <div class="progress-fill" id="sam-progress"></div>
+            </div>
+            <div class="loader-detail" id="sam-loader-detail">0%</div>
+          </div>
+        </div>
+        <!-- SAM Main Content -->
+        <div class="sam-container hidden" id="sam-container">
+          <div class="sam-upload" id="sam-upload">
+            <input type="file" id="sam-file-input" accept="image/*" style="display: none;">
+            <div class="sam-upload-content" onclick="document.getElementById('sam-file-input').click()">
+              <span class="sam-upload-icon">🖼️</span>
+              <span>Drop image or click to upload</span>
+            </div>
+          </div>
+          <div class="sam-workspace hidden" id="sam-workspace">
+            <canvas id="sam-canvas"></canvas>
+            <canvas id="sam-mask-canvas"></canvas>
+          </div>
+        </div>
+        <div class="btn-group mt-2">
+          <button onclick="Demo.loadSampleImage()" id="sam-sample-btn" disabled>Sample Image</button>
+          <button class="btn-secondary" onclick="Demo.clearSegmentation()" id="sam-clear-btn" disabled>Clear</button>
+          <button class="btn-secondary" onclick="Demo.downloadMask()" id="sam-download-btn" disabled>Download</button>
+        </div>
+        <div class="output mt-2" id="sam-output">Loading SAM model... Please wait.</div>
+      </div>
+
+      <!-- LLM Chat -->
+      <div class="bento-card span-6">
+        <div class="card-header">
+          <div class="card-icon green">💬</div>
+          <div>
+            <div class="card-title">AI Chat</div>
+            <div class="card-desc">TinyLlama 1.1B running in your browser (~714MB)</div>
+          </div>
+        </div>
+        <!-- LLM Loading State -->
+        <div class="model-loader" id="llm-loader">
+          <div class="loader-content">
+            <div class="loader-info">
+              <p>TinyLlama is a 1.1B parameter language model.</p>
+              <p class="loader-warning">Download size: ~714MB (may take several minutes)</p>
+            </div>
+            <button onclick="Demo.loadLLM()" id="llm-load-btn" class="loader-btn">Load Model</button>
+            <div class="progress-bar hidden" id="llm-progress-container">
+              <div class="progress-fill" id="llm-progress"></div>
+            </div>
+            <div class="loader-detail hidden" id="llm-loader-detail">0%</div>
+          </div>
+        </div>
+        <!-- LLM Chat Content -->
+        <div class="chat-container hidden" id="chat-container">
+          <div class="chat-messages" id="chat-messages">
+            <div class="chat-welcome">
+              <span class="chat-welcome-icon">🤖</span>
+              <p>Hi! I'm TinyLlama running entirely in your browser.</p>
+              <p class="chat-welcome-hint">Ask me anything!</p>
+            </div>
+          </div>
+          <div class="chat-input-container">
+            <input type="text" id="chat-input" placeholder="Type a message..." class="chat-input">
+            <button onclick="Demo.sendChat()" id="chat-send-btn">Send</button>
+          </div>
+        </div>
+        <div class="chat-status" id="chat-status">
+          <span class="chat-status-dot"></span>
+          <span id="chat-status-text">Click "Load Model" to start</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 3: Core Operations -->
     <div class="bento-grid">
       <!-- Tensor Operations -->
       <div class="bento-card span-4">
@@ -108,7 +196,7 @@
       </div>
     </div>
 
-    <!-- Row 3: Tools -->
+    <!-- Row 4: Tools -->
     <div class="bento-grid">
       <!-- Quantization -->
       <div class="bento-card span-4">
@@ -153,7 +241,7 @@
       </div>
     </div>
 
-    <!-- Row 4: System -->
+    <!-- Row 5: System -->
     <div class="bento-grid">
       <!-- Scheduler -->
       <div class="bento-card span-4">
@@ -199,7 +287,7 @@
       </div>
     </div>
 
-    <!-- Row 5: Monitor -->
+    <!-- Row 6: Monitor -->
     <div class="bento-grid">
       <div class="bento-card span-12">
         <div class="card-header">

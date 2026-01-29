@@ -197,12 +197,16 @@ export {
   SentimentAnalysisPipeline,
   FeatureExtractionPipeline,
   ImageClassificationPipeline,
+  TextGenerationPipeline,
+  ImageSegmentationPipeline,
   
   // Factory functions
   createTextClassificationPipeline,
   createSentimentAnalysisPipeline,
   createFeatureExtractionPipeline,
   createImageClassificationPipeline,
+  createTextGenerationPipeline,
+  createImageSegmentationPipeline,
   
   // Options types
   type PipelineFactoryOptions,
@@ -210,6 +214,22 @@ export {
   type FeatureExtractionOptions,
   type ImageClassificationOptions,
   type ImageInput,
+  
+  // Text Generation types
+  type TextGenerationOptions,
+  type TextGenerationResult,
+  type GenerationStreamEvent,
+  type ChatMessage,
+  type ChatOptions,
+  type ChatTemplateType,
+  type LLMLoadProgress,
+  
+  // Image Segmentation types
+  type ImageSegmentationOptions,
+  type ImageSegmentationResult,
+  type PointPrompt,
+  type BoxPrompt,
+  type ModelLoadProgress,
 } from './pipelines/index.js';
 
 // ============================================================================

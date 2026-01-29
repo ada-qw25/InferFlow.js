@@ -58,9 +58,9 @@ BasePipeline, registerPipeline, getPipelineFactory,
 // Labels
 SENTIMENT_LABELS, EMOTION_LABELS, IMAGENET_LABELS, 
 // Pipelines
-TextClassificationPipeline, SentimentAnalysisPipeline, FeatureExtractionPipeline, ImageClassificationPipeline, 
+TextClassificationPipeline, SentimentAnalysisPipeline, FeatureExtractionPipeline, ImageClassificationPipeline, TextGenerationPipeline, ImageSegmentationPipeline, 
 // Factory functions
-createTextClassificationPipeline, createSentimentAnalysisPipeline, createFeatureExtractionPipeline, createImageClassificationPipeline, } from './pipelines/index.js';
+createTextClassificationPipeline, createSentimentAnalysisPipeline, createFeatureExtractionPipeline, createImageClassificationPipeline, createTextGenerationPipeline, createImageSegmentationPipeline, } from './pipelines/index.js';
 // ============================================================================
 // Utility Exports
 // ============================================================================

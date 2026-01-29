@@ -3,10 +3,19 @@
  *
  * Autoregressive text generation with streaming support.
  * Supports GPT-2, LLaMA, Mistral, and other causal LM models.
+ * Includes chat/conversation support with message history.
  */
 import { BasePipeline } from './base.js';
+import { Tokenizer } from '../utils/tokenizer.js';
 import { EdgeFlowTensor, softmax } from '../core/tensor.js';
-import { runInference } from '../core/runtime.js';
+import { runInference, loadModelFromBuffer } from '../core/runtime.js';
+// ============================================================================
+// Default Model URLs (TinyLlama - quantized for browser)
+// ============================================================================
+const DEFAULT_LLM_MODELS = {
+    model: 'https://huggingface.co/Xenova/TinyLlama-1.1B-Chat-v1.0/resolve/main/onnx/model_q4f16.onnx',
+    tokenizer: 'https://huggingface.co/Xenova/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json',
+};
 // ============================================================================
 // Text Generation Pipeline
 // ============================================================================
@@ -30,11 +39,114 @@ import { runInference } from '../core/runtime.js';
 export class TextGenerationPipeline extends BasePipeline {
     tokenizer = null;
     eosTokenId = 50256; // GPT-2 default
+    llmModel = null;
+    modelsLoaded = false;
+    // Custom model URLs
+    modelUrl;
+    tokenizerUrl;
     constructor(config) {
         super(config ?? {
             task: 'text-generation',
             model: 'default',
         });
+        this.modelUrl = DEFAULT_LLM_MODELS.model;
+        this.tokenizerUrl = DEFAULT_LLM_MODELS.tokenizer;
+    }
+    /**
+     * Check if model is loaded
+     */
+    get isModelLoaded() {
+        return this.modelsLoaded;
+    }
+    /**
+     * Set custom model URLs
+     */
+    setModelUrls(model, tokenizer) {
+        this.modelUrl = model;
+        this.tokenizerUrl = tokenizer;
+    }
+    /**
+     * Load model and tokenizer with progress callback
+     */
+    async loadModel(onProgress) {
+        if (this.modelsLoaded)
+            return;
+        // Load tokenizer first (small, fast)
+        onProgress?.({ stage: 'tokenizer', loaded: 0, total: 100, progress: 0 });
+        try {
+            const tokenizerResponse = await fetch(this.tokenizerUrl);
+            if (!tokenizerResponse.ok) {
+                throw new Error(`Failed to fetch tokenizer: ${tokenizerResponse.status}`);
+            }
+            const tokenizerJson = await tokenizerResponse.json();
+            this.tokenizer = await Tokenizer.fromJSON(tokenizerJson);
+            const specialIds = this.tokenizer.getSpecialTokenIds();
+            this.eosTokenId = specialIds.eosTokenId ?? specialIds.sepTokenId ?? 2; // TinyLlama uses 2 as EOS
+            onProgress?.({ stage: 'tokenizer', loaded: 100, total: 100, progress: 100 });
+        }
+        catch (error) {
+            throw new Error(`Failed to load tokenizer: ${error}`);
+        }
+        // Load model with progress tracking
+        onProgress?.({ stage: 'model', loaded: 0, total: 100, progress: 0 });
+        const modelData = await this.fetchModelWithProgress(this.modelUrl, (loaded, total) => {
+            onProgress?.({
+                stage: 'model',
+                loaded,
+                total,
+                progress: Math.round((loaded / total) * 100),
+            });
+        });
+        this.llmModel = await loadModelFromBuffer(modelData, {
+            runtime: 'wasm',
+        });
+        this.model = this.llmModel;
+        this.modelsLoaded = true;
+    }
+    /**
+     * Fetch model with progress tracking
+     */
+    async fetchModelWithProgress(url, onProgress) {
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch model: ${response.status} ${response.statusText}`);
+        }
+        const contentLength = response.headers.get('content-length');
+        const total = contentLength ? parseInt(contentLength, 10) : 0;
+        if (!response.body) {
+            // Fallback if no streaming support
+            const buffer = await response.arrayBuffer();
+            onProgress(buffer.byteLength, buffer.byteLength);
+            return buffer;
+        }
+        const reader = response.body.getReader();
+        const chunks = [];
+        let loaded = 0;
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done)
+                break;
+            chunks.push(value);
+            loaded += value.length;
+            onProgress(loaded, total || loaded);
+        }
+        // Combine chunks into ArrayBuffer
+        const buffer = new Uint8Array(loaded);
+        let offset = 0;
+        for (const chunk of chunks) {
+            buffer.set(chunk, offset);
+            offset += chunk.length;
+        }
+        return buffer.buffer;
+    }
+    /**
+     * Initialize pipeline (override to skip default model loading)
+     */
+    async initialize() {
+        if (this.isReady)
+            return;
+        // Don't call super.initialize() - we handle model loading separately
+        this.isReady = true;
     }
     /**
      * Set tokenizer
@@ -313,6 +425,317 @@ export class TextGenerationPipeline extends BasePipeline {
         }
         // Fallback
         return candidateIndices[0] ?? 0;
+    }
+    // ==========================================================================
+    // Chat / Conversation Support
+    // ==========================================================================
+    conversationHistory = [];
+    chatTemplateType = 'chatml';
+    /**
+     * Set the chat template type
+     */
+    setChatTemplate(templateType) {
+        this.chatTemplateType = templateType;
+    }
+    /**
+     * Apply chat template to messages
+     */
+    applyChatTemplate(messages, options) {
+        const templateType = options?.templateType ?? this.chatTemplateType;
+        switch (templateType) {
+            case 'chatml':
+                return this.applyChatMLTemplate(messages);
+            case 'llama2':
+                return this.applyLlama2Template(messages);
+            case 'llama3':
+                return this.applyLlama3Template(messages);
+            case 'mistral':
+                return this.applyMistralTemplate(messages);
+            case 'phi3':
+                return this.applyPhi3Template(messages);
+            case 'alpaca':
+                return this.applyAlpacaTemplate(messages);
+            case 'vicuna':
+                return this.applyVicunaTemplate(messages);
+            case 'custom':
+                return this.applyCustomTemplate(messages, options?.customTemplate ?? {});
+            default:
+                return this.applyChatMLTemplate(messages);
+        }
+    }
+    /**
+     * ChatML template (used by many models including Qwen, Yi)
+     */
+    applyChatMLTemplate(messages) {
+        let prompt = '';
+        for (const msg of messages) {
+            prompt += `<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`;
+        }
+        prompt += '<|im_start|>assistant\n';
+        return prompt;
+    }
+    /**
+     * Llama 2 template
+     */
+    applyLlama2Template(messages) {
+        let prompt = '';
+        let systemMsg = '';
+        for (const msg of messages) {
+            if (msg.role === 'system') {
+                systemMsg = msg.content;
+            }
+            else if (msg.role === 'user') {
+                if (systemMsg) {
+                    prompt += `<s>[INST] <<SYS>>\n${systemMsg}\n<</SYS>>\n\n${msg.content} [/INST]`;
+                    systemMsg = '';
+                }
+                else {
+                    prompt += `<s>[INST] ${msg.content} [/INST]`;
+                }
+            }
+            else if (msg.role === 'assistant') {
+                prompt += ` ${msg.content} </s>`;
+            }
+        }
+        return prompt;
+    }
+    /**
+     * Llama 3 template
+     */
+    applyLlama3Template(messages) {
+        let prompt = '<|begin_of_text|>';
+        for (const msg of messages) {
+            prompt += `<|start_header_id|>${msg.role}<|end_header_id|>\n\n${msg.content}<|eot_id|>`;
+        }
+        prompt += '<|start_header_id|>assistant<|end_header_id|>\n\n';
+        return prompt;
+    }
+    /**
+     * Mistral template
+     */
+    applyMistralTemplate(messages) {
+        let prompt = '<s>';
+        for (const msg of messages) {
+            if (msg.role === 'user') {
+                prompt += `[INST] ${msg.content} [/INST]`;
+            }
+            else if (msg.role === 'assistant') {
+                prompt += ` ${msg.content}</s>`;
+            }
+            else if (msg.role === 'system') {
+                prompt += `[INST] ${msg.content}\n`;
+            }
+        }
+        return prompt;
+    }
+    /**
+     * Phi-3 template
+     */
+    applyPhi3Template(messages) {
+        let prompt = '';
+        for (const msg of messages) {
+            prompt += `<|${msg.role}|>\n${msg.content}<|end|>\n`;
+        }
+        prompt += '<|assistant|>\n';
+        return prompt;
+    }
+    /**
+     * Alpaca template
+     */
+    applyAlpacaTemplate(messages) {
+        let prompt = '';
+        let instruction = '';
+        let input = '';
+        for (const msg of messages) {
+            if (msg.role === 'system') {
+                instruction = msg.content;
+            }
+            else if (msg.role === 'user') {
+                input = msg.content;
+            }
+        }
+        if (instruction) {
+            prompt = `### Instruction:\n${instruction}\n\n`;
+        }
+        if (input) {
+            prompt += `### Input:\n${input}\n\n`;
+        }
+        prompt += '### Response:\n';
+        return prompt;
+    }
+    /**
+     * Vicuna template
+     */
+    applyVicunaTemplate(messages) {
+        let prompt = '';
+        for (const msg of messages) {
+            if (msg.role === 'system') {
+                prompt += `${msg.content}\n\n`;
+            }
+            else if (msg.role === 'user') {
+                prompt += `USER: ${msg.content}\n`;
+            }
+            else if (msg.role === 'assistant') {
+                prompt += `ASSISTANT: ${msg.content}\n`;
+            }
+        }
+        prompt += 'ASSISTANT:';
+        return prompt;
+    }
+    /**
+     * Custom template
+     */
+    applyCustomTemplate(messages, template) {
+        const { systemPrefix = '', systemSuffix = '\n', userPrefix = 'User: ', userSuffix = '\n', assistantPrefix = 'Assistant: ', assistantSuffix = '\n', separator = '', } = template;
+        let prompt = '';
+        for (let i = 0; i < messages.length; i++) {
+            const msg = messages[i];
+            if (i > 0)
+                prompt += separator;
+            switch (msg.role) {
+                case 'system':
+                    prompt += `${systemPrefix}${msg.content}${systemSuffix}`;
+                    break;
+                case 'user':
+                    prompt += `${userPrefix}${msg.content}${userSuffix}`;
+                    break;
+                case 'assistant':
+                    prompt += `${assistantPrefix}${msg.content}${assistantSuffix}`;
+                    break;
+            }
+        }
+        prompt += assistantPrefix;
+        return prompt;
+    }
+    /**
+     * Chat with the model
+     *
+     * @example
+     * ```typescript
+     * const generator = await pipeline('text-generation', 'model');
+     *
+     * // Single turn
+     * const response = await generator.chat('Hello, how are you?');
+     *
+     * // Multi-turn with history
+     * const response1 = await generator.chat('What is AI?');
+     * const response2 = await generator.chat('Can you give an example?');
+     *
+     * // With system prompt
+     * const response = await generator.chat('Hello', {
+     *   systemPrompt: 'You are a helpful assistant.',
+     * });
+     * ```
+     */
+    async chat(userMessage, options) {
+        // Add system message if provided and not already present
+        if (options?.systemPrompt &&
+            (this.conversationHistory.length === 0 || this.conversationHistory[0]?.role !== 'system')) {
+            this.conversationHistory.unshift({
+                role: 'system',
+                content: options.systemPrompt,
+            });
+        }
+        // Add user message
+        this.conversationHistory.push({
+            role: 'user',
+            content: userMessage,
+        });
+        // Apply chat template
+        const prompt = this.applyChatTemplate(this.conversationHistory, options);
+        // Generate response
+        const result = await this.run(prompt, {
+            ...options,
+            stopSequences: [
+                ...(options?.stopSequences ?? []),
+                '<|im_end|>',
+                '<|end|>',
+                '<|eot_id|>',
+                '</s>',
+                '\n\nUser:',
+                '\n\nHuman:',
+            ],
+        });
+        // Add assistant response to history
+        const response = Array.isArray(result) ? result[0] : result;
+        this.conversationHistory.push({
+            role: 'assistant',
+            content: response.generatedText.trim(),
+        });
+        return response;
+    }
+    /**
+     * Stream chat response
+     */
+    async *chatStream(userMessage, options) {
+        // Add system message if provided
+        if (options?.systemPrompt &&
+            (this.conversationHistory.length === 0 || this.conversationHistory[0]?.role !== 'system')) {
+            this.conversationHistory.unshift({
+                role: 'system',
+                content: options.systemPrompt,
+            });
+        }
+        // Add user message
+        this.conversationHistory.push({
+            role: 'user',
+            content: userMessage,
+        });
+        // Apply chat template
+        const prompt = this.applyChatTemplate(this.conversationHistory, options);
+        // Stream response
+        let fullResponse = '';
+        for await (const event of this.stream(prompt, {
+            ...options,
+            stopSequences: [
+                ...(options?.stopSequences ?? []),
+                '<|im_end|>',
+                '<|end|>',
+                '<|eot_id|>',
+                '</s>',
+            ],
+        })) {
+            fullResponse = event.generatedText;
+            yield event;
+        }
+        // Add assistant response to history
+        this.conversationHistory.push({
+            role: 'assistant',
+            content: fullResponse.trim(),
+        });
+    }
+    /**
+     * Get conversation history
+     */
+    getConversationHistory() {
+        return [...this.conversationHistory];
+    }
+    /**
+     * Set conversation history
+     */
+    setConversationHistory(messages) {
+        this.conversationHistory = [...messages];
+    }
+    /**
+     * Clear conversation history
+     */
+    clearConversation() {
+        this.conversationHistory = [];
+    }
+    /**
+     * Remove last exchange (user message + assistant response)
+     */
+    undoLastExchange() {
+        // Remove assistant message
+        if (this.conversationHistory.length > 0 &&
+            this.conversationHistory[this.conversationHistory.length - 1]?.role === 'assistant') {
+            this.conversationHistory.pop();
+        }
+        // Remove user message
+        if (this.conversationHistory.length > 0 &&
+            this.conversationHistory[this.conversationHistory.length - 1]?.role === 'user') {
+            this.conversationHistory.pop();
+        }
     }
 }
 // ============================================================================

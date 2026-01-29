@@ -5520,8 +5520,11 @@ registerPipeline("image-classification", (config) => new ImageClassificationPipe
 
 // dist/pipelines/text-generation.js
 init_tensor();
+var DEFAULT_LLM_MODELS = {
+  model: "https://huggingface.co/Xenova/TinyLlama-1.1B-Chat-v1.0/resolve/main/onnx/model_q4f16.onnx",
+  tokenizer: "https://huggingface.co/Xenova/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json"
+};
 var TextGenerationPipeline = class extends BasePipeline {
-  // GPT-2 default
   constructor(config) {
     super(config ?? {
       task: "text-generation",
@@ -5529,6 +5532,109 @@ var TextGenerationPipeline = class extends BasePipeline {
     });
     __publicField(this, "tokenizer", null);
     __publicField(this, "eosTokenId", 50256);
+    // GPT-2 default
+    __publicField(this, "llmModel", null);
+    __publicField(this, "modelsLoaded", false);
+    // Custom model URLs
+    __publicField(this, "modelUrl");
+    __publicField(this, "tokenizerUrl");
+    // ==========================================================================
+    // Chat / Conversation Support
+    // ==========================================================================
+    __publicField(this, "conversationHistory", []);
+    __publicField(this, "chatTemplateType", "chatml");
+    this.modelUrl = DEFAULT_LLM_MODELS.model;
+    this.tokenizerUrl = DEFAULT_LLM_MODELS.tokenizer;
+  }
+  /**
+   * Check if model is loaded
+   */
+  get isModelLoaded() {
+    return this.modelsLoaded;
+  }
+  /**
+   * Set custom model URLs
+   */
+  setModelUrls(model, tokenizer) {
+    this.modelUrl = model;
+    this.tokenizerUrl = tokenizer;
+  }
+  /**
+   * Load model and tokenizer with progress callback
+   */
+  async loadModel(onProgress) {
+    if (this.modelsLoaded)
+      return;
+    onProgress?.({ stage: "tokenizer", loaded: 0, total: 100, progress: 0 });
+    try {
+      const tokenizerResponse = await fetch(this.tokenizerUrl);
+      if (!tokenizerResponse.ok) {
+        throw new Error(`Failed to fetch tokenizer: ${tokenizerResponse.status}`);
+      }
+      const tokenizerJson = await tokenizerResponse.json();
+      this.tokenizer = await Tokenizer.fromJSON(tokenizerJson);
+      const specialIds = this.tokenizer.getSpecialTokenIds();
+      this.eosTokenId = specialIds.eosTokenId ?? specialIds.sepTokenId ?? 2;
+      onProgress?.({ stage: "tokenizer", loaded: 100, total: 100, progress: 100 });
+    } catch (error) {
+      throw new Error(`Failed to load tokenizer: ${error}`);
+    }
+    onProgress?.({ stage: "model", loaded: 0, total: 100, progress: 0 });
+    const modelData = await this.fetchModelWithProgress(this.modelUrl, (loaded, total) => {
+      onProgress?.({
+        stage: "model",
+        loaded,
+        total,
+        progress: Math.round(loaded / total * 100)
+      });
+    });
+    this.llmModel = await loadModelFromBuffer(modelData, {
+      runtime: "wasm"
+    });
+    this.model = this.llmModel;
+    this.modelsLoaded = true;
+  }
+  /**
+   * Fetch model with progress tracking
+   */
+  async fetchModelWithProgress(url, onProgress) {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch model: ${response.status} ${response.statusText}`);
+    }
+    const contentLength = response.headers.get("content-length");
+    const total = contentLength ? parseInt(contentLength, 10) : 0;
+    if (!response.body) {
+      const buffer2 = await response.arrayBuffer();
+      onProgress(buffer2.byteLength, buffer2.byteLength);
+      return buffer2;
+    }
+    const reader = response.body.getReader();
+    const chunks = [];
+    let loaded = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      chunks.push(value);
+      loaded += value.length;
+      onProgress(loaded, total || loaded);
+    }
+    const buffer = new Uint8Array(loaded);
+    let offset = 0;
+    for (const chunk of chunks) {
+      buffer.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return buffer.buffer;
+  }
+  /**
+   * Initialize pipeline (override to skip default model loading)
+   */
+  async initialize() {
+    if (this.isReady)
+      return;
+    this.isReady = true;
   }
   /**
    * Set tokenizer
@@ -5769,7 +5875,313 @@ var TextGenerationPipeline = class extends BasePipeline {
     }
     return candidateIndices[0] ?? 0;
   }
+  /**
+   * Set the chat template type
+   */
+  setChatTemplate(templateType) {
+    this.chatTemplateType = templateType;
+  }
+  /**
+   * Apply chat template to messages
+   */
+  applyChatTemplate(messages, options) {
+    const templateType = options?.templateType ?? this.chatTemplateType;
+    switch (templateType) {
+      case "chatml":
+        return this.applyChatMLTemplate(messages);
+      case "llama2":
+        return this.applyLlama2Template(messages);
+      case "llama3":
+        return this.applyLlama3Template(messages);
+      case "mistral":
+        return this.applyMistralTemplate(messages);
+      case "phi3":
+        return this.applyPhi3Template(messages);
+      case "alpaca":
+        return this.applyAlpacaTemplate(messages);
+      case "vicuna":
+        return this.applyVicunaTemplate(messages);
+      case "custom":
+        return this.applyCustomTemplate(messages, options?.customTemplate ?? {});
+      default:
+        return this.applyChatMLTemplate(messages);
+    }
+  }
+  /**
+   * ChatML template (used by many models including Qwen, Yi)
+   */
+  applyChatMLTemplate(messages) {
+    let prompt = "";
+    for (const msg of messages) {
+      prompt += `<|im_start|>${msg.role}
+${msg.content}<|im_end|>
+`;
+    }
+    prompt += "<|im_start|>assistant\n";
+    return prompt;
+  }
+  /**
+   * Llama 2 template
+   */
+  applyLlama2Template(messages) {
+    let prompt = "";
+    let systemMsg = "";
+    for (const msg of messages) {
+      if (msg.role === "system") {
+        systemMsg = msg.content;
+      } else if (msg.role === "user") {
+        if (systemMsg) {
+          prompt += `<s>[INST] <<SYS>>
+${systemMsg}
+<</SYS>>
+
+${msg.content} [/INST]`;
+          systemMsg = "";
+        } else {
+          prompt += `<s>[INST] ${msg.content} [/INST]`;
+        }
+      } else if (msg.role === "assistant") {
+        prompt += ` ${msg.content} </s>`;
+      }
+    }
+    return prompt;
+  }
+  /**
+   * Llama 3 template
+   */
+  applyLlama3Template(messages) {
+    let prompt = "<|begin_of_text|>";
+    for (const msg of messages) {
+      prompt += `<|start_header_id|>${msg.role}<|end_header_id|>
+
+${msg.content}<|eot_id|>`;
+    }
+    prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n";
+    return prompt;
+  }
+  /**
+   * Mistral template
+   */
+  applyMistralTemplate(messages) {
+    let prompt = "<s>";
+    for (const msg of messages) {
+      if (msg.role === "user") {
+        prompt += `[INST] ${msg.content} [/INST]`;
+      } else if (msg.role === "assistant") {
+        prompt += ` ${msg.content}</s>`;
+      } else if (msg.role === "system") {
+        prompt += `[INST] ${msg.content}
+`;
+      }
+    }
+    return prompt;
+  }
+  /**
+   * Phi-3 template
+   */
+  applyPhi3Template(messages) {
+    let prompt = "";
+    for (const msg of messages) {
+      prompt += `<|${msg.role}|>
+${msg.content}<|end|>
+`;
+    }
+    prompt += "<|assistant|>\n";
+    return prompt;
+  }
+  /**
+   * Alpaca template
+   */
+  applyAlpacaTemplate(messages) {
+    let prompt = "";
+    let instruction = "";
+    let input = "";
+    for (const msg of messages) {
+      if (msg.role === "system") {
+        instruction = msg.content;
+      } else if (msg.role === "user") {
+        input = msg.content;
+      }
+    }
+    if (instruction) {
+      prompt = `### Instruction:
+${instruction}
+
+`;
+    }
+    if (input) {
+      prompt += `### Input:
+${input}
+
+`;
+    }
+    prompt += "### Response:\n";
+    return prompt;
+  }
+  /**
+   * Vicuna template
+   */
+  applyVicunaTemplate(messages) {
+    let prompt = "";
+    for (const msg of messages) {
+      if (msg.role === "system") {
+        prompt += `${msg.content}
+
+`;
+      } else if (msg.role === "user") {
+        prompt += `USER: ${msg.content}
+`;
+      } else if (msg.role === "assistant") {
+        prompt += `ASSISTANT: ${msg.content}
+`;
+      }
+    }
+    prompt += "ASSISTANT:";
+    return prompt;
+  }
+  /**
+   * Custom template
+   */
+  applyCustomTemplate(messages, template) {
+    const { systemPrefix = "", systemSuffix = "\n", userPrefix = "User: ", userSuffix = "\n", assistantPrefix = "Assistant: ", assistantSuffix = "\n", separator = "" } = template;
+    let prompt = "";
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (i > 0)
+        prompt += separator;
+      switch (msg.role) {
+        case "system":
+          prompt += `${systemPrefix}${msg.content}${systemSuffix}`;
+          break;
+        case "user":
+          prompt += `${userPrefix}${msg.content}${userSuffix}`;
+          break;
+        case "assistant":
+          prompt += `${assistantPrefix}${msg.content}${assistantSuffix}`;
+          break;
+      }
+    }
+    prompt += assistantPrefix;
+    return prompt;
+  }
+  /**
+   * Chat with the model
+   *
+   * @example
+   * ```typescript
+   * const generator = await pipeline('text-generation', 'model');
+   *
+   * // Single turn
+   * const response = await generator.chat('Hello, how are you?');
+   *
+   * // Multi-turn with history
+   * const response1 = await generator.chat('What is AI?');
+   * const response2 = await generator.chat('Can you give an example?');
+   *
+   * // With system prompt
+   * const response = await generator.chat('Hello', {
+   *   systemPrompt: 'You are a helpful assistant.',
+   * });
+   * ```
+   */
+  async chat(userMessage, options) {
+    if (options?.systemPrompt && (this.conversationHistory.length === 0 || this.conversationHistory[0]?.role !== "system")) {
+      this.conversationHistory.unshift({
+        role: "system",
+        content: options.systemPrompt
+      });
+    }
+    this.conversationHistory.push({
+      role: "user",
+      content: userMessage
+    });
+    const prompt = this.applyChatTemplate(this.conversationHistory, options);
+    const result = await this.run(prompt, {
+      ...options,
+      stopSequences: [
+        ...options?.stopSequences ?? [],
+        "<|im_end|>",
+        "<|end|>",
+        "<|eot_id|>",
+        "</s>",
+        "\n\nUser:",
+        "\n\nHuman:"
+      ]
+    });
+    const response = Array.isArray(result) ? result[0] : result;
+    this.conversationHistory.push({
+      role: "assistant",
+      content: response.generatedText.trim()
+    });
+    return response;
+  }
+  /**
+   * Stream chat response
+   */
+  async *chatStream(userMessage, options) {
+    if (options?.systemPrompt && (this.conversationHistory.length === 0 || this.conversationHistory[0]?.role !== "system")) {
+      this.conversationHistory.unshift({
+        role: "system",
+        content: options.systemPrompt
+      });
+    }
+    this.conversationHistory.push({
+      role: "user",
+      content: userMessage
+    });
+    const prompt = this.applyChatTemplate(this.conversationHistory, options);
+    let fullResponse = "";
+    for await (const event of this.stream(prompt, {
+      ...options,
+      stopSequences: [
+        ...options?.stopSequences ?? [],
+        "<|im_end|>",
+        "<|end|>",
+        "<|eot_id|>",
+        "</s>"
+      ]
+    })) {
+      fullResponse = event.generatedText;
+      yield event;
+    }
+    this.conversationHistory.push({
+      role: "assistant",
+      content: fullResponse.trim()
+    });
+  }
+  /**
+   * Get conversation history
+   */
+  getConversationHistory() {
+    return [...this.conversationHistory];
+  }
+  /**
+   * Set conversation history
+   */
+  setConversationHistory(messages) {
+    this.conversationHistory = [...messages];
+  }
+  /**
+   * Clear conversation history
+   */
+  clearConversation() {
+    this.conversationHistory = [];
+  }
+  /**
+   * Remove last exchange (user message + assistant response)
+   */
+  undoLastExchange() {
+    if (this.conversationHistory.length > 0 && this.conversationHistory[this.conversationHistory.length - 1]?.role === "assistant") {
+      this.conversationHistory.pop();
+    }
+    if (this.conversationHistory.length > 0 && this.conversationHistory[this.conversationHistory.length - 1]?.role === "user") {
+      this.conversationHistory.pop();
+    }
+  }
 };
+function createTextGenerationPipeline(config) {
+  return new TextGenerationPipeline(config);
+}
 
 // dist/pipelines/object-detection.js
 init_tensor();
@@ -6426,6 +6838,429 @@ var QuestionAnsweringPipeline = class extends BasePipeline {
   }
 };
 
+// dist/pipelines/image-segmentation.js
+init_tensor();
+var DEFAULT_SAM_MODELS = {
+  encoder: "https://huggingface.co/Xenova/slimsam-77-uniform/resolve/main/onnx/vision_encoder_quantized.onnx",
+  decoder: "https://huggingface.co/Xenova/slimsam-77-uniform/resolve/main/onnx/prompt_encoder_mask_decoder_quantized.onnx"
+};
+var ImageSegmentationPipeline = class extends BasePipeline {
+  constructor(config) {
+    super(config);
+    __publicField(this, "encoderModel", null);
+    __publicField(this, "decoderModel", null);
+    __publicField(this, "imageEmbedding", null);
+    __publicField(this, "currentImageSize", null);
+    __publicField(this, "resizedImageSize", null);
+    __publicField(this, "inputSize", 1024);
+    // SAM default input size
+    __publicField(this, "modelsLoaded", false);
+    // Custom model URLs
+    __publicField(this, "encoderUrl");
+    __publicField(this, "decoderUrl");
+    this.encoderUrl = DEFAULT_SAM_MODELS.encoder;
+    this.decoderUrl = DEFAULT_SAM_MODELS.decoder;
+  }
+  /**
+   * Check if models are loaded
+   */
+  get isModelsLoaded() {
+    return this.modelsLoaded;
+  }
+  /**
+   * Set custom model URLs
+   */
+  setModelUrls(encoder, decoder) {
+    this.encoderUrl = encoder;
+    this.decoderUrl = decoder;
+  }
+  /**
+   * Load both encoder and decoder models with progress callback
+   */
+  async loadModels(onProgress) {
+    if (this.modelsLoaded)
+      return;
+    onProgress?.({ model: "encoder", loaded: 0, total: 100, progress: 0 });
+    const encoderData = await this.fetchModelWithProgress(this.encoderUrl, (loaded, total) => {
+      onProgress?.({
+        model: "encoder",
+        loaded,
+        total,
+        progress: Math.round(loaded / total * 100)
+      });
+    });
+    this.encoderModel = await loadModelFromBuffer(encoderData, {
+      runtime: "wasm"
+    });
+    onProgress?.({ model: "decoder", loaded: 0, total: 100, progress: 0 });
+    const decoderData = await this.fetchModelWithProgress(this.decoderUrl, (loaded, total) => {
+      onProgress?.({
+        model: "decoder",
+        loaded,
+        total,
+        progress: Math.round(loaded / total * 100)
+      });
+    });
+    this.decoderModel = await loadModelFromBuffer(decoderData, {
+      runtime: "wasm"
+    });
+    this.modelsLoaded = true;
+  }
+  /**
+   * Fetch model with progress tracking
+   */
+  async fetchModelWithProgress(url, onProgress) {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch model: ${response.status} ${response.statusText}`);
+    }
+    const contentLength = response.headers.get("content-length");
+    const total = contentLength ? parseInt(contentLength, 10) : 0;
+    if (!response.body) {
+      const buffer2 = await response.arrayBuffer();
+      onProgress(buffer2.byteLength, buffer2.byteLength);
+      return buffer2;
+    }
+    const reader = response.body.getReader();
+    const chunks = [];
+    let loaded = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      chunks.push(value);
+      loaded += value.length;
+      onProgress(loaded, total || loaded);
+    }
+    const buffer = new Uint8Array(loaded);
+    let offset = 0;
+    for (const chunk of chunks) {
+      buffer.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return buffer.buffer;
+  }
+  /**
+   * Initialize pipeline (override to skip default model loading)
+   */
+  async initialize() {
+    if (this.isReady)
+      return;
+    this.isReady = true;
+  }
+  /**
+   * Load encoder model (processes the image once)
+   */
+  async loadEncoder(modelUrl) {
+    this.encoderModel = await loadModel(modelUrl, {
+      runtime: "wasm"
+    });
+  }
+  /**
+   * Load decoder model (processes prompts to generate masks)
+   */
+  async loadDecoder(modelUrl) {
+    this.decoderModel = await loadModel(modelUrl, {
+      runtime: "wasm"
+    });
+  }
+  /**
+   * Set and encode the image (call once per image)
+   */
+  async setImage(image) {
+    if (!this.modelsLoaded) {
+      throw new Error("Models not loaded. Call loadModels() first.");
+    }
+    const imageData = await this.loadImage(image);
+    this.currentImageSize = {
+      width: imageData.width,
+      height: imageData.height
+    };
+    const { tensor: inputTensor, resizedSize } = this.preprocessImage(imageData);
+    this.resizedImageSize = resizedSize;
+    if (this.encoderModel) {
+      const outputs = await runInference(this.encoderModel, [inputTensor]);
+      this.imageEmbedding = outputs[0];
+    } else {
+      throw new Error("Encoder model not loaded");
+    }
+  }
+  /**
+   * Segment the image with given prompts
+   */
+  async segment(options = {}) {
+    if (!this.imageEmbedding || !this.currentImageSize || !this.resizedImageSize) {
+      throw new Error("No image set. Call setImage() first.");
+    }
+    if (!this.decoderModel) {
+      throw new Error("Decoder model not loaded");
+    }
+    const startTime = performance.now();
+    const { points = [], boxes = [], maskThreshold = 0, returnAllMasks = false } = options;
+    const decoderInputs = this.prepareDecoderInputs(points, boxes);
+    const outputs = await runInference(this.decoderModel, [
+      this.imageEmbedding,
+      ...decoderInputs
+    ]);
+    const masks = outputs[0];
+    const scores = outputs[1];
+    const result = this.postprocessMasks(masks, scores, maskThreshold, returnAllMasks);
+    result.processingTime = performance.now() - startTime;
+    return result;
+  }
+  /**
+   * Run segmentation (implements BasePipeline interface)
+   */
+  async run(input, options) {
+    await this.setImage(input);
+    return this.segment(options);
+  }
+  /**
+   * Load image from various sources
+   */
+  async loadImage(input) {
+    if (typeof input === "string") {
+      return this.loadImageFromUrl(input);
+    } else if (input instanceof HTMLImageElement) {
+      return this.imageElementToImageData(input);
+    } else if (input instanceof HTMLCanvasElement) {
+      return this.canvasToImageData(input);
+    } else if (input instanceof ImageData) {
+      return input;
+    } else if (typeof ImageBitmap !== "undefined" && input instanceof ImageBitmap) {
+      return this.imageBitmapToImageData(input);
+    }
+    throw new Error("Unsupported image input type");
+  }
+  /**
+   * Load image from URL
+   */
+  async loadImageFromUrl(url) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+        resolve(ctx.getImageData(0, 0, img.width, img.height));
+      };
+      img.onerror = reject;
+      img.src = url;
+    });
+  }
+  /**
+   * Convert HTMLImageElement to ImageData
+   */
+  imageElementToImageData(img) {
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth || img.width;
+    canvas.height = img.naturalHeight || img.height;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+  }
+  /**
+   * Convert canvas to ImageData
+   */
+  canvasToImageData(canvas) {
+    const ctx = canvas.getContext("2d");
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+  }
+  /**
+   * Convert ImageBitmap to ImageData
+   */
+  imageBitmapToImageData(bitmap) {
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(bitmap, 0, 0);
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+  }
+  /**
+   * Preprocess image for SAM
+   */
+  preprocessImage(imageData) {
+    const { width, height } = imageData;
+    const scale = this.inputSize / Math.max(width, height);
+    const newWidth = Math.round(width * scale);
+    const newHeight = Math.round(height * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = this.inputSize;
+    canvas.height = this.inputSize;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = `rgb(123.675, 116.28, 103.53)`;
+    ctx.fillRect(0, 0, this.inputSize, this.inputSize);
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = width;
+    tempCanvas.height = height;
+    const tempCtx = tempCanvas.getContext("2d");
+    tempCtx.putImageData(imageData, 0, 0);
+    ctx.drawImage(tempCanvas, 0, 0, newWidth, newHeight);
+    const resizedData = ctx.getImageData(0, 0, this.inputSize, this.inputSize);
+    const tensorData = new Float32Array(3 * this.inputSize * this.inputSize);
+    const mean2 = [123.675, 116.28, 103.53];
+    const std = [58.395, 57.12, 57.375];
+    for (let i = 0; i < this.inputSize * this.inputSize; i++) {
+      const pixelIdx = i * 4;
+      tensorData[i] = (resizedData.data[pixelIdx] - mean2[0]) / std[0];
+      tensorData[this.inputSize * this.inputSize + i] = (resizedData.data[pixelIdx + 1] - mean2[1]) / std[1];
+      tensorData[2 * this.inputSize * this.inputSize + i] = (resizedData.data[pixelIdx + 2] - mean2[2]) / std[2];
+    }
+    return {
+      tensor: new EdgeFlowTensor(tensorData, [1, 3, this.inputSize, this.inputSize], "float32"),
+      resizedSize: { width: newWidth, height: newHeight }
+    };
+  }
+  /**
+   * Prepare decoder inputs (prompts)
+   */
+  prepareDecoderInputs(points, boxes) {
+    const { width: resizedW, height: resizedH } = this.resizedImageSize;
+    const { width: origW, height: origH } = this.currentImageSize;
+    const scaleX = resizedW;
+    const scaleY = resizedH;
+    const allPoints = [];
+    const allLabels = [];
+    for (const point of points) {
+      allPoints.push(point.x * scaleX, point.y * scaleY);
+      allLabels.push(point.label);
+    }
+    for (const box of boxes) {
+      allPoints.push(box.x1 * scaleX, box.y1 * scaleY);
+      allLabels.push(2);
+      allPoints.push(box.x2 * scaleX, box.y2 * scaleY);
+      allLabels.push(3);
+    }
+    if (allPoints.length === 0) {
+      allPoints.push(resizedW / 2, resizedH / 2);
+      allLabels.push(1);
+    }
+    const numPoints = allLabels.length;
+    const pointCoords = new EdgeFlowTensor(new Float32Array(allPoints), [1, 1, numPoints, 2], "float32");
+    const pointLabels = new EdgeFlowTensor(BigInt64Array.from(allLabels.map((l) => BigInt(l))), [1, 1, numPoints], "int64");
+    const origImSize = new EdgeFlowTensor(BigInt64Array.from([BigInt(origH), BigInt(origW)]), [2], "int64");
+    return [pointCoords, pointLabels, origImSize];
+  }
+  /**
+   * Post-process masks from decoder output
+   */
+  postprocessMasks(masks, scores, threshold, returnAllMasks) {
+    const { width, height } = this.currentImageSize;
+    const scoresData = scores.toFloat32Array();
+    const masksData = masks.toFloat32Array();
+    const numMasks = scoresData.length;
+    const maskShape = masks.shape;
+    const maskH = maskShape[2] ?? height;
+    const maskW = maskShape[3] ?? width;
+    let bestIdx = 0;
+    let bestScore = scoresData[0] ?? 0;
+    for (let i = 1; i < numMasks; i++) {
+      if ((scoresData[i] ?? 0) > bestScore) {
+        bestScore = scoresData[i] ?? 0;
+        bestIdx = i;
+      }
+    }
+    const outputMask = this.resizeMask(masksData, bestIdx, maskW, maskH, width, height, threshold);
+    const result = {
+      mask: outputMask,
+      width,
+      height,
+      score: bestScore
+    };
+    if (returnAllMasks && numMasks > 1) {
+      result.allMasks = [];
+      for (let m = 0; m < numMasks; m++) {
+        const mask = this.resizeMask(masksData, m, maskW, maskH, width, height, threshold);
+        result.allMasks.push({
+          mask,
+          score: scoresData[m] ?? 0
+        });
+      }
+    }
+    return result;
+  }
+  /**
+   * Resize mask from model output size to original image size
+   */
+  resizeMask(masksData, maskIdx, srcW, srcH, dstW, dstH, threshold) {
+    const outputMask = new Uint8Array(dstW * dstH);
+    const maskOffset = maskIdx * srcW * srcH;
+    for (let y = 0; y < dstH; y++) {
+      for (let x = 0; x < dstW; x++) {
+        const srcX = x / dstW * srcW;
+        const srcY = y / dstH * srcH;
+        const x0 = Math.floor(srcX);
+        const x1 = Math.min(x0 + 1, srcW - 1);
+        const y0 = Math.floor(srcY);
+        const y1 = Math.min(y0 + 1, srcH - 1);
+        const xFrac = srcX - x0;
+        const yFrac = srcY - y0;
+        const v00 = masksData[maskOffset + y0 * srcW + x0] ?? 0;
+        const v01 = masksData[maskOffset + y0 * srcW + x1] ?? 0;
+        const v10 = masksData[maskOffset + y1 * srcW + x0] ?? 0;
+        const v11 = masksData[maskOffset + y1 * srcW + x1] ?? 0;
+        const value = v00 * (1 - xFrac) * (1 - yFrac) + v01 * xFrac * (1 - yFrac) + v10 * (1 - xFrac) * yFrac + v11 * xFrac * yFrac;
+        const sigmoid2 = 1 / (1 + Math.exp(-value));
+        outputMask[y * dstW + x] = sigmoid2 > threshold ? 255 : 0;
+      }
+    }
+    return outputMask;
+  }
+  /**
+   * Clear the current image embedding
+   */
+  clearImage() {
+    this.imageEmbedding = null;
+    this.currentImageSize = null;
+    this.resizedImageSize = null;
+  }
+  /**
+   * Preprocess (required by BasePipeline)
+   */
+  async preprocess(input) {
+    const imageData = await this.loadImage(input);
+    const { tensor: tensor2 } = this.preprocessImage(imageData);
+    return [tensor2];
+  }
+  /**
+   * Postprocess (required by BasePipeline)
+   */
+  async postprocess(_outputs, _options) {
+    return {
+      mask: new Uint8Array(0),
+      width: 0,
+      height: 0,
+      score: 0
+    };
+  }
+  /**
+   * Dispose resources
+   */
+  dispose() {
+    super.dispose();
+    this.encoderModel?.dispose();
+    this.decoderModel?.dispose();
+    this.imageEmbedding = null;
+    this.currentImageSize = null;
+    this.resizedImageSize = null;
+    this.modelsLoaded = false;
+  }
+};
+function createImageSegmentationPipeline(config = {}) {
+  return new ImageSegmentationPipeline({
+    task: "image-segmentation",
+    model: config.model ?? "slimsam",
+    runtime: config.runtime,
+    cache: config.cache ?? true,
+    quantization: config.quantization
+  });
+}
+registerPipeline("image-segmentation", (config) => new ImageSegmentationPipeline(config));
+
 // dist/pipelines/index.js
 async function pipeline(task, options) {
   const config = {
@@ -6463,6 +7298,9 @@ async function pipeline(task, options) {
       break;
     case "question-answering":
       pipelineInstance = new QuestionAnsweringPipeline(config);
+      break;
+    case "image-segmentation":
+      pipelineInstance = new ImageSegmentationPipeline(config);
       break;
     default:
       throw new Error(`Unknown pipeline task: ${task}`);
@@ -9194,6 +10032,7 @@ export {
   IMAGENET_LABELS,
   ImageClassificationPipeline,
   ImagePreprocessor,
+  ImageSegmentationPipeline,
   InferenceCache,
   InferenceScheduler,
   LoadedModelImpl,
@@ -9207,6 +10046,7 @@ export {
   SENTIMENT_LABELS,
   SentimentAnalysisPipeline,
   TextClassificationPipeline,
+  TextGenerationPipeline,
   Tokenizer,
   VERSION,
   WASMRuntime,
@@ -9232,10 +10072,12 @@ export {
   createFeatureExtractionPipeline,
   createImageClassificationPipeline,
   createImagePreprocessor,
+  createImageSegmentationPipeline,
   createPipelines,
   createSentimentAnalysisPipeline,
   createTensorHeatmap,
   createTextClassificationPipeline,
+  createTextGenerationPipeline,
   createWASMRuntime,
   createWebGPURuntime,
   createWebNNRuntime,

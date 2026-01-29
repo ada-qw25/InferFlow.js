@@ -3,11 +3,38 @@
  *
  * Autoregressive text generation with streaming support.
  * Supports GPT-2, LLaMA, Mistral, and other causal LM models.
+ * Includes chat/conversation support with message history.
  */
 import { BasePipeline, PipelineResult } from './base.js';
 import { Tokenizer } from '../utils/tokenizer.js';
 import { EdgeFlowTensor } from '../core/tensor.js';
 import { PipelineConfig, PipelineOptions } from '../core/types.js';
+/**
+ * LLM model loading progress callback
+ */
+export interface LLMLoadProgress {
+    /** Stage: 'tokenizer' or 'model' */
+    stage: 'tokenizer' | 'model';
+    /** Bytes loaded */
+    loaded: number;
+    /** Total bytes */
+    total: number;
+    /** Progress percentage (0-100) */
+    progress: number;
+}
+/**
+ * Chat message
+ */
+export interface ChatMessage {
+    /** Role: 'system', 'user', or 'assistant' */
+    role: 'system' | 'user' | 'assistant';
+    /** Message content */
+    content: string;
+}
+/**
+ * Chat template type
+ */
+export type ChatTemplateType = 'chatml' | 'llama2' | 'llama3' | 'mistral' | 'phi3' | 'alpaca' | 'vicuna' | 'custom';
 /**
  * Text generation options
  */
@@ -36,6 +63,25 @@ export interface TextGenerationOptions {
     returnFullText?: boolean;
     /** Callback for each generated token */
     onToken?: (token: string, tokenId: number) => void;
+}
+/**
+ * Chat generation options
+ */
+export interface ChatOptions extends TextGenerationOptions {
+    /** System prompt */
+    systemPrompt?: string;
+    /** Chat template type */
+    templateType?: ChatTemplateType;
+    /** Custom template (if templateType is 'custom') */
+    customTemplate?: {
+        systemPrefix?: string;
+        systemSuffix?: string;
+        userPrefix?: string;
+        userSuffix?: string;
+        assistantPrefix?: string;
+        assistantSuffix?: string;
+        separator?: string;
+    };
 }
 /**
  * Text generation result
@@ -83,7 +129,31 @@ export interface GenerationStreamEvent {
 export declare class TextGenerationPipeline extends BasePipeline<string | string[], TextGenerationResult | TextGenerationResult[]> {
     private tokenizer;
     private eosTokenId;
+    private llmModel;
+    private modelsLoaded;
+    private modelUrl;
+    private tokenizerUrl;
     constructor(config?: PipelineConfig);
+    /**
+     * Check if model is loaded
+     */
+    get isModelLoaded(): boolean;
+    /**
+     * Set custom model URLs
+     */
+    setModelUrls(model: string, tokenizer: string): void;
+    /**
+     * Load model and tokenizer with progress callback
+     */
+    loadModel(onProgress?: (progress: LLMLoadProgress) => void): Promise<void>;
+    /**
+     * Fetch model with progress tracking
+     */
+    private fetchModelWithProgress;
+    /**
+     * Initialize pipeline (override to skip default model loading)
+     */
+    initialize(): Promise<void>;
     /**
      * Set tokenizer
      */
@@ -120,6 +190,89 @@ export declare class TextGenerationPipeline extends BasePipeline<string | string
      * Sample from probability distribution with top-k/top-p filtering
      */
     private sample;
+    private conversationHistory;
+    private chatTemplateType;
+    /**
+     * Set the chat template type
+     */
+    setChatTemplate(templateType: ChatTemplateType): void;
+    /**
+     * Apply chat template to messages
+     */
+    applyChatTemplate(messages: ChatMessage[], options?: ChatOptions): string;
+    /**
+     * ChatML template (used by many models including Qwen, Yi)
+     */
+    private applyChatMLTemplate;
+    /**
+     * Llama 2 template
+     */
+    private applyLlama2Template;
+    /**
+     * Llama 3 template
+     */
+    private applyLlama3Template;
+    /**
+     * Mistral template
+     */
+    private applyMistralTemplate;
+    /**
+     * Phi-3 template
+     */
+    private applyPhi3Template;
+    /**
+     * Alpaca template
+     */
+    private applyAlpacaTemplate;
+    /**
+     * Vicuna template
+     */
+    private applyVicunaTemplate;
+    /**
+     * Custom template
+     */
+    private applyCustomTemplate;
+    /**
+     * Chat with the model
+     *
+     * @example
+     * ```typescript
+     * const generator = await pipeline('text-generation', 'model');
+     *
+     * // Single turn
+     * const response = await generator.chat('Hello, how are you?');
+     *
+     * // Multi-turn with history
+     * const response1 = await generator.chat('What is AI?');
+     * const response2 = await generator.chat('Can you give an example?');
+     *
+     * // With system prompt
+     * const response = await generator.chat('Hello', {
+     *   systemPrompt: 'You are a helpful assistant.',
+     * });
+     * ```
+     */
+    chat(userMessage: string, options?: ChatOptions): Promise<TextGenerationResult>;
+    /**
+     * Stream chat response
+     */
+    chatStream(userMessage: string, options?: ChatOptions): AsyncGenerator<GenerationStreamEvent>;
+    /**
+     * Get conversation history
+     */
+    getConversationHistory(): ChatMessage[];
+    /**
+     * Set conversation history
+     */
+    setConversationHistory(messages: ChatMessage[]): void;
+    /**
+     * Clear conversation history
+     */
+    clearConversation(): void;
+    /**
+     * Remove last exchange (user message + assistant response)
+     */
+    undoLastExchange(): void;
 }
 /**
  * Create text generation pipeline

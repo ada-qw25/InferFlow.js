@@ -674,3 +674,357 @@ footer a:hover {
   .modal { height: 95vh; }
   .modal-overlay { padding: var(--space-lg); }
 }
+
+/* ==========================================================================
+   12. SAM Interactive Segmentation
+   ========================================================================== */
+
+.sam-container {
+  position: relative;
+  width: 100%;
+  min-height: 250px;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--color-dark);
+}
+
+.sam-upload {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border: 2px dashed rgba(255, 255, 255, 0.3);
+  border-radius: var(--radius-md);
+  transition: all 0.3s;
+}
+
+.sam-upload:hover {
+  border-color: var(--accent);
+  background: rgba(127, 169, 33, 0.1);
+}
+
+.sam-upload-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-sm);
+  color: var(--color-light);
+  opacity: 0.7;
+}
+
+.sam-upload-icon {
+  font-size: 2.5rem;
+}
+
+.sam-workspace {
+  position: relative;
+  width: 100%;
+  height: 250px;
+}
+
+.sam-workspace canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+#sam-canvas {
+  z-index: 1;
+}
+
+#sam-mask-canvas {
+  z-index: 2;
+  pointer-events: none;
+  opacity: 0.5;
+}
+
+/* Click indicator */
+.sam-point {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 3;
+  pointer-events: none;
+  animation: pointPulse 0.3s ease-out;
+}
+
+.sam-point.positive {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(127, 169, 33, 0.3);
+}
+
+.sam-point.negative {
+  background: var(--error);
+  box-shadow: 0 0 0 3px rgba(196, 92, 74, 0.3);
+}
+
+@keyframes pointPulse {
+  0% { transform: translate(-50%, -50%) scale(0); opacity: 0; }
+  50% { transform: translate(-50%, -50%) scale(1.2); }
+  100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+}
+
+/* ==========================================================================
+   13. AI Chat
+   ========================================================================== */
+
+.chat-container {
+  display: flex;
+  flex-direction: column;
+  height: 280px;
+  background: var(--color-dark);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.chat-welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  text-align: center;
+  color: var(--color-light);
+  opacity: 0.7;
+}
+
+.chat-welcome-icon {
+  font-size: 2.5rem;
+  margin-bottom: var(--space-sm);
+}
+
+.chat-welcome p {
+  margin: var(--space-xs) 0;
+  font-size: 0.875rem;
+}
+
+.chat-welcome-hint {
+  opacity: 0.6;
+  font-size: 0.75rem !important;
+}
+
+.chat-message {
+  max-width: 85%;
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-md);
+  font-size: 0.875rem;
+  line-height: 1.5;
+  animation: messageSlide 0.2s ease-out;
+}
+
+@keyframes messageSlide {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.chat-message.user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: white;
+  border-bottom-right-radius: 4px;
+}
+
+.chat-message.assistant {
+  align-self: flex-start;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--color-light);
+  border-bottom-left-radius: 4px;
+}
+
+.chat-message.assistant.typing::after {
+  content: '▋';
+  animation: blink 0.7s infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.chat-input-container {
+  display: flex;
+  gap: var(--space-sm);
+  padding: var(--space-sm);
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.chat-input {
+  flex: 1;
+  padding: var(--space-sm) var(--space-md);
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: var(--radius-full);
+  color: var(--color-light);
+  font-size: 0.875rem;
+}
+
+.chat-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.chat-input::placeholder {
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.chat-input-container button {
+  padding: var(--space-sm) var(--space-lg);
+  font-size: 0.75rem;
+}
+
+.chat-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) 0;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.chat-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.chat-status-dot.loading {
+  background: var(--warning);
+  animation: pulse 0.5s infinite;
+}
+
+.chat-status-dot.error {
+  background: var(--error);
+  animation: none;
+}
+
+/* ==========================================================================
+   14. Model Loader
+   ========================================================================== */
+
+.model-loader {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 250px;
+  background: var(--color-dark);
+  border-radius: var(--radius-md);
+  padding: var(--space-xl);
+}
+
+.loader-content {
+  text-align: center;
+  max-width: 300px;
+}
+
+.loader-spinner {
+  width: 48px;
+  height: 48px;
+  margin: 0 auto var(--space-lg);
+  border: 3px solid rgba(127, 169, 33, 0.2);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+.loader-text {
+  color: var(--color-light);
+  font-size: 0.875rem;
+  margin-bottom: var(--space-sm);
+}
+
+.loader-detail {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+}
+
+.loader-info {
+  color: var(--color-light);
+  font-size: 0.875rem;
+  margin-bottom: var(--space-lg);
+  line-height: 1.6;
+}
+
+.loader-info p {
+  margin: var(--space-xs) 0;
+}
+
+.loader-warning {
+  color: var(--warning) !important;
+  font-size: 0.75rem !important;
+  opacity: 0.9;
+}
+
+.loader-btn {
+  margin-bottom: var(--space-lg);
+}
+
+/* Progress Bar */
+.progress-bar {
+  width: 100%;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  margin: var(--space-md) 0;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+  border-radius: var(--radius-full);
+  width: 0%;
+  transition: width 0.3s ease;
+}
+
+.progress-fill.downloading {
+  background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+  animation: progressPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes progressPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+/* Model loader states */
+.model-loader.loading .loader-spinner {
+  display: block;
+}
+
+.model-loader.ready {
+  display: none;
+}
+
+/* Success state for SAM */
+.sam-ready .model-loader {
+  display: none;
+}
+
+.sam-ready .sam-container {
+  display: block !important;
+}

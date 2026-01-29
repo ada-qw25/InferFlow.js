@@ -6,8 +6,10 @@
  * 2. Utilities
  * 3. UI Helpers
  * 4. Core Features
- * 5. Demo Class (Public API)
- * 6. Initialization
+ * 5. SAM Interactive Segmentation (Real Model)
+ * 6. AI Chat (Real Model)
+ * 7. Demo Class (Public API)
+ * 8. Initialization
  */
 
 import * as edgeFlow from '/dist/edgeflow.browser.js';
@@ -23,6 +25,20 @@ const state = {
   model: null,
   testTensors: [],
   monitor: null,
+  // SAM state
+  samPipeline: null,
+  samModelLoaded: false,
+  samImage: null,
+  samPoints: [],
+  samCanvas: null,
+  samMaskCanvas: null,
+  samCtx: null,
+  samMaskCtx: null,
+  // Chat state
+  chatPipeline: null,
+  chatModelLoaded: false,
+  chatHistory: [],
+  chatGenerating: false,
 };
 
 const config = {
@@ -752,7 +768,597 @@ const features = {
 };
 
 /* ==========================================================================
-   5. Demo Class (Public API)
+   5. SAM Interactive Segmentation (Real Model)
+   ========================================================================== */
+
+const sam = {
+  /**
+   * Initialize SAM UI and start model loading
+   */
+  async init() {
+    const fileInput = ui.$('sam-file-input');
+    const container = ui.$('sam-container');
+    
+    if (fileInput) {
+      fileInput.addEventListener('change', (e) => this.handleFileSelect(e));
+    }
+    
+    // Drag and drop
+    if (container) {
+      container.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        container.classList.add('dragover');
+      });
+      container.addEventListener('dragleave', () => {
+        container.classList.remove('dragover');
+      });
+      container.addEventListener('drop', (e) => {
+        e.preventDefault();
+        container.classList.remove('dragover');
+        const file = e.dataTransfer?.files[0];
+        if (file && file.type.startsWith('image/')) {
+          this.loadImage(file);
+        }
+      });
+    }
+
+    // Start loading SAM models automatically
+    await this.loadModels();
+  },
+
+  /**
+   * Load SAM models with progress display
+   */
+  async loadModels() {
+    const loader = ui.$('sam-loader');
+    const loaderText = ui.$('sam-loader-text');
+    const loaderDetail = ui.$('sam-loader-detail');
+    const progress = ui.$('sam-progress');
+    const samContainer = ui.$('sam-container');
+    
+    try {
+      // Create pipeline
+      state.samPipeline = edgeFlow.createImageSegmentationPipeline();
+      
+      // Load models with progress
+      await state.samPipeline.loadModels((progressInfo) => {
+        const { model, progress: pct, loaded, total } = progressInfo;
+        
+        if (loaderText) {
+          loaderText.textContent = `Loading ${model}... (${utils.formatBytes(loaded)} / ${utils.formatBytes(total)})`;
+        }
+        if (loaderDetail) {
+          loaderDetail.textContent = `${pct}%`;
+        }
+        if (progress) {
+          progress.style.width = `${pct}%`;
+        }
+      });
+      
+      state.samModelLoaded = true;
+      
+      // Hide loader, show main UI
+      if (loader) loader.classList.add('hidden');
+      if (samContainer) samContainer.classList.remove('hidden');
+      
+      // Enable buttons
+      ui.$('sam-sample-btn')?.removeAttribute('disabled');
+      ui.$('sam-clear-btn')?.removeAttribute('disabled');
+      ui.$('sam-download-btn')?.removeAttribute('disabled');
+      
+      ui.setOutput('sam-output', '✓ SAM model loaded! Click to upload an image or use "Sample Image".', 'success');
+      
+    } catch (error) {
+      console.error('SAM model loading failed:', error);
+      
+      if (loaderText) {
+        loaderText.textContent = `Failed to load model: ${error.message}`;
+        loaderText.style.color = 'var(--error)';
+      }
+      if (loaderDetail) {
+        loaderDetail.textContent = 'Check console for details';
+      }
+      
+      ui.showError('sam-output', error);
+    }
+  },
+
+  /**
+   * Handle file selection
+   */
+  handleFileSelect(e) {
+    const file = e.target?.files?.[0];
+    if (file) {
+      this.loadImage(file);
+    }
+  },
+
+  /**
+   * Load image from file or URL
+   */
+  async loadImage(source) {
+    if (!state.samModelLoaded) {
+      ui.setOutput('sam-output', 'Model not loaded yet. Please wait...', 'warn');
+      return;
+    }
+    
+    ui.setOutput('sam-output', 'Loading image...', 'info');
+    
+    try {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        
+        if (typeof source === 'string') {
+          img.src = source;
+        } else {
+          img.src = URL.createObjectURL(source);
+        }
+      });
+      
+      // Show workspace
+      ui.$('sam-upload')?.classList.add('hidden');
+      ui.$('sam-workspace')?.classList.remove('hidden');
+      
+      // Setup canvases
+      const canvas = ui.$('sam-canvas');
+      const maskCanvas = ui.$('sam-mask-canvas');
+      
+      if (canvas && maskCanvas) {
+        state.samCanvas = canvas;
+        state.samMaskCanvas = maskCanvas;
+        state.samCtx = canvas.getContext('2d');
+        state.samMaskCtx = maskCanvas.getContext('2d');
+        
+        // Set canvas size
+        const container = ui.$('sam-workspace');
+        const containerWidth = container?.clientWidth || 400;
+        const containerHeight = container?.clientHeight || 250;
+        
+        const scale = Math.min(
+          containerWidth / img.width,
+          containerHeight / img.height
+        );
+        
+        canvas.width = img.width * scale;
+        canvas.height = img.height * scale;
+        maskCanvas.width = canvas.width;
+        maskCanvas.height = canvas.height;
+        
+        // Draw image
+        state.samCtx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        state.samImage = img;
+        state.samPoints = [];
+        
+        // Setup click handler
+        canvas.onclick = (e) => this.handleClick(e, 1); // Left click = positive
+        canvas.oncontextmenu = (e) => {
+          e.preventDefault();
+          this.handleClick(e, 0); // Right click = negative
+        };
+        
+        // Encode image with SAM encoder
+        ui.setOutput('sam-output', 'Encoding image with SAM...', 'info');
+        const encodeStart = performance.now();
+        await state.samPipeline.setImage(img);
+        const encodeTime = (performance.now() - encodeStart).toFixed(0);
+        
+        ui.setOutput('sam-output', `✓ Image encoded in ${encodeTime}ms. Click to segment objects. Left-click = include, Right-click = exclude.`, 'success');
+      }
+    } catch (error) {
+      ui.showError('sam-output', error);
+    }
+  },
+
+  /**
+   * Load sample image
+   */
+  async loadSampleImage() {
+    if (!state.samModelLoaded) {
+      ui.setOutput('sam-output', 'Model not loaded yet. Please wait...', 'warn');
+      return;
+    }
+    
+    // Using a reliable public image URL
+    const sampleUrl = 'https://images.unsplash.com/photo-1587300003388-59208cc962cb?w=640';
+    await this.loadImage(sampleUrl);
+  },
+
+  /**
+   * Handle canvas click
+   */
+  async handleClick(e, label) {
+    if (!state.samCanvas || !state.samPipeline || !state.samModelLoaded) return;
+    
+    const rect = state.samCanvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = (e.clientY - rect.top) / rect.height;
+    
+    // Add point
+    state.samPoints.push({ x, y, label });
+    
+    // Draw point indicator
+    this.drawPoints();
+    
+    // Run segmentation
+    ui.setOutput('sam-output', 'Segmenting...', 'info');
+    
+    try {
+      const startTime = performance.now();
+      const result = await state.samPipeline.segment({
+        points: state.samPoints,
+      });
+      const time = (performance.now() - startTime).toFixed(0);
+      
+      // Draw mask
+      this.drawMask(result);
+      
+      ui.setOutput('sam-output', `✓ Segmented in ${time}ms (score: ${result.score.toFixed(2)})`, 'success');
+    } catch (error) {
+      ui.showError('sam-output', error);
+    }
+  },
+
+  /**
+   * Draw points on canvas
+   */
+  drawPoints() {
+    // Remove existing point indicators
+    document.querySelectorAll('.sam-point').forEach(el => el.remove());
+    
+    const workspace = ui.$('sam-workspace');
+    if (!workspace || !state.samCanvas) return;
+    
+    for (const point of state.samPoints) {
+      const indicator = document.createElement('div');
+      indicator.className = `sam-point ${point.label === 1 ? 'positive' : 'negative'}`;
+      indicator.style.left = `${point.x * 100}%`;
+      indicator.style.top = `${point.y * 100}%`;
+      workspace.appendChild(indicator);
+    }
+  },
+
+  /**
+   * Draw segmentation mask
+   */
+  drawMask(result) {
+    if (!state.samMaskCtx || !state.samMaskCanvas) return;
+    
+    const { mask, width, height } = result;
+    const canvas = state.samMaskCanvas;
+    
+    // Create ImageData
+    const imageData = state.samMaskCtx.createImageData(canvas.width, canvas.height);
+    
+    // Scale mask to canvas size
+    const scaleX = width / canvas.width;
+    const scaleY = height / canvas.height;
+    
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+        const srcX = Math.floor(x * scaleX);
+        const srcY = Math.floor(y * scaleY);
+        const srcIdx = srcY * width + srcX;
+        const dstIdx = (y * canvas.width + x) * 4;
+        
+        if (mask[srcIdx] > 0) {
+          // Green overlay for segmented area
+          imageData.data[dstIdx] = 127;     // R
+          imageData.data[dstIdx + 1] = 169; // G
+          imageData.data[dstIdx + 2] = 33;  // B
+          imageData.data[dstIdx + 3] = 180; // A
+        }
+      }
+    }
+    
+    state.samMaskCtx.putImageData(imageData, 0, 0);
+  },
+
+  /**
+   * Clear segmentation
+   */
+  clear() {
+    state.samPoints = [];
+    
+    // Clear mask canvas
+    if (state.samMaskCtx && state.samMaskCanvas) {
+      state.samMaskCtx.clearRect(0, 0, state.samMaskCanvas.width, state.samMaskCanvas.height);
+    }
+    
+    // Remove point indicators
+    document.querySelectorAll('.sam-point').forEach(el => el.remove());
+    
+    ui.setOutput('sam-output', 'Cleared. Click to segment objects.', 'info');
+  },
+
+  /**
+   * Download mask as PNG
+   */
+  downloadMask() {
+    if (!state.samMaskCanvas) {
+      ui.setOutput('sam-output', 'No mask to download', 'warn');
+      return;
+    }
+    
+    // Create download link
+    const link = document.createElement('a');
+    link.download = 'segmentation-mask.png';
+    link.href = state.samMaskCanvas.toDataURL('image/png');
+    link.click();
+  },
+
+  /**
+   * Reset to upload state
+   */
+  reset() {
+    state.samImage = null;
+    state.samPoints = [];
+    
+    ui.$('sam-upload')?.classList.remove('hidden');
+    ui.$('sam-workspace')?.classList.add('hidden');
+    
+    document.querySelectorAll('.sam-point').forEach(el => el.remove());
+    
+    if (state.samMaskCtx && state.samMaskCanvas) {
+      state.samMaskCtx.clearRect(0, 0, state.samMaskCanvas.width, state.samMaskCanvas.height);
+    }
+    
+    // Clear the pipeline's image embedding
+    if (state.samPipeline) {
+      state.samPipeline.clearImage();
+    }
+    
+    ui.setOutput('sam-output', 'Click on image to segment objects. Left-click = include, Right-click = exclude.', 'info');
+  },
+};
+
+/* ==========================================================================
+   6. AI Chat (Real Model)
+   ========================================================================== */
+
+const chat = {
+  /**
+   * Initialize chat UI
+   */
+  init() {
+    const input = ui.$('chat-input');
+    if (input) {
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey && !state.chatGenerating) {
+          e.preventDefault();
+          this.send();
+        }
+      });
+    }
+  },
+
+  /**
+   * Load LLM model with progress display
+   */
+  async loadModel() {
+    if (state.chatModelLoaded) {
+      ui.$('chat-container')?.classList.remove('hidden');
+      ui.$('llm-loader')?.classList.add('hidden');
+      return;
+    }
+    
+    const loadBtn = ui.$('llm-load-btn');
+    const progressContainer = ui.$('llm-progress-container');
+    const progress = ui.$('llm-progress');
+    const loaderDetail = ui.$('llm-loader-detail');
+    
+    try {
+      // Disable button and show progress
+      if (loadBtn) {
+        loadBtn.disabled = true;
+        loadBtn.textContent = 'Loading...';
+      }
+      if (progressContainer) progressContainer.classList.remove('hidden');
+      if (loaderDetail) loaderDetail.classList.remove('hidden');
+      
+      this.updateStatus('loading', 'Downloading model...');
+      
+      // Create pipeline
+      state.chatPipeline = edgeFlow.createTextGenerationPipeline();
+      state.chatPipeline.setChatTemplate('chatml');
+      
+      // Load model with progress
+      await state.chatPipeline.loadModel((progressInfo) => {
+        const { stage, progress: pct, loaded, total } = progressInfo;
+        
+        if (loadBtn) {
+          if (stage === 'tokenizer') {
+            loadBtn.textContent = 'Loading tokenizer...';
+          } else {
+            loadBtn.textContent = `Loading model... ${utils.formatBytes(loaded)}`;
+          }
+        }
+        if (loaderDetail) {
+          loaderDetail.textContent = `${stage}: ${pct}%`;
+        }
+        if (progress) {
+          // Tokenizer is quick, model is the main download
+          const totalProgress = stage === 'tokenizer' ? pct * 0.05 : 5 + pct * 0.95;
+          progress.style.width = `${totalProgress}%`;
+        }
+      });
+      
+      state.chatModelLoaded = true;
+      
+      // Hide loader, show chat UI
+      ui.$('llm-loader')?.classList.add('hidden');
+      ui.$('chat-container')?.classList.remove('hidden');
+      
+      this.updateStatus('ready', 'Model loaded! Ready to chat');
+      
+    } catch (error) {
+      console.error('LLM model loading failed:', error);
+      
+      if (loadBtn) {
+        loadBtn.disabled = false;
+        loadBtn.textContent = 'Retry Load';
+      }
+      if (loaderDetail) {
+        loaderDetail.textContent = `Error: ${error.message}`;
+        loaderDetail.style.color = 'var(--error)';
+      }
+      
+      this.updateStatus('error', `Failed: ${error.message}`);
+    }
+  },
+
+  /**
+   * Send message
+   */
+  async send() {
+    if (!state.chatModelLoaded) {
+      this.updateStatus('error', 'Load model first by clicking "Load Model"');
+      return;
+    }
+    
+    const input = ui.$('chat-input');
+    const message = input?.value?.trim();
+    
+    if (!message || state.chatGenerating) return;
+    
+    // Clear input
+    input.value = '';
+    
+    // Hide welcome message
+    const welcome = ui.$('chat-messages')?.querySelector('.chat-welcome');
+    if (welcome) welcome.remove();
+    
+    // Add user message
+    this.addMessage('user', message);
+    
+    // Set generating state
+    state.chatGenerating = true;
+    this.updateStatus('loading', 'Generating...');
+    
+    try {
+      // Add assistant message placeholder
+      const assistantMsg = this.addMessage('assistant', '', true);
+      
+      // Generate response using real model
+      let response = '';
+      
+      // Use streaming if available
+      if (state.chatPipeline.chatStream) {
+        for await (const event of state.chatPipeline.chatStream(message, {
+          maxNewTokens: 256,
+          temperature: 0.7,
+          topP: 0.9,
+        })) {
+          response = event.generatedText;
+          assistantMsg.textContent = response;
+          
+          // Scroll to bottom
+          const container = ui.$('chat-messages');
+          if (container) {
+            container.scrollTop = container.scrollHeight;
+          }
+        }
+      } else {
+        // Fallback to non-streaming
+        const result = await state.chatPipeline.chat(message, {
+          maxNewTokens: 256,
+          temperature: 0.7,
+          topP: 0.9,
+        });
+        response = result.generatedText;
+        assistantMsg.textContent = response;
+      }
+      
+      // Remove typing indicator
+      assistantMsg.classList.remove('typing');
+      
+      // Update history
+      state.chatHistory.push(
+        { role: 'user', content: message },
+        { role: 'assistant', content: response }
+      );
+      
+      this.updateStatus('ready', 'Ready to chat');
+    } catch (error) {
+      this.updateStatus('error', `Error: ${error.message}`);
+      // Remove typing indicator
+      const typingMsg = ui.$('chat-messages')?.querySelector('.typing');
+      if (typingMsg) typingMsg.remove();
+    } finally {
+      state.chatGenerating = false;
+    }
+    
+    // Scroll to bottom
+    const container = ui.$('chat-messages');
+    if (container) {
+      container.scrollTop = container.scrollHeight;
+    }
+  },
+
+  /**
+   * Add message to chat
+   */
+  addMessage(role, content, isTyping = false) {
+    const container = ui.$('chat-messages');
+    if (!container) return null;
+    
+    const msg = document.createElement('div');
+    msg.className = `chat-message ${role}${isTyping ? ' typing' : ''}`;
+    msg.textContent = content;
+    
+    container.appendChild(msg);
+    container.scrollTop = container.scrollHeight;
+    
+    return msg;
+  },
+
+  /**
+   * Update status indicator
+   */
+  updateStatus(status, text) {
+    const dot = ui.$('chat-status')?.querySelector('.chat-status-dot');
+    const textEl = ui.$('chat-status-text');
+    
+    if (dot) {
+      dot.className = `chat-status-dot ${status === 'loading' ? 'loading' : status === 'error' ? 'error' : ''}`;
+    }
+    
+    if (textEl) {
+      textEl.textContent = text;
+    }
+  },
+
+  /**
+   * Clear chat history
+   */
+  clear() {
+    state.chatHistory = [];
+    
+    // Clear conversation in pipeline
+    if (state.chatPipeline) {
+      state.chatPipeline.clearConversation();
+    }
+    
+    const container = ui.$('chat-messages');
+    if (container) {
+      container.innerHTML = `
+        <div class="chat-welcome">
+          <span class="chat-welcome-icon">🤖</span>
+          <p>Hi! I'm TinyLlama running entirely in your browser.</p>
+          <p class="chat-welcome-hint">Ask me anything!</p>
+        </div>
+      `;
+    }
+    
+    this.updateStatus('ready', 'Ready to chat');
+  },
+};
+
+/* ==========================================================================
+   7. Demo Class (Public API)
    ========================================================================== */
 
 /**
@@ -762,6 +1368,16 @@ window.Demo = {
   // Model
   loadModel: () => features.loadModel(),
   testModel: () => features.testModel(),
+
+  // SAM Interactive Segmentation
+  loadSampleImage: () => sam.loadSampleImage(),
+  clearSegmentation: () => sam.clear(),
+  downloadMask: () => sam.downloadMask(),
+
+  // AI Chat
+  loadLLM: () => chat.loadModel(),
+  sendChat: () => chat.send(),
+  clearChat: () => chat.clear(),
 
   // Core
   testTensors: () => features.testTensors(),
@@ -790,7 +1406,7 @@ window.Demo = {
 };
 
 /* ==========================================================================
-   6. Initialization
+   8. Initialization
    ========================================================================== */
 
 /**
@@ -801,6 +1417,12 @@ async function init() {
   ui.initOutputs();
   await ui.updateRuntimeStatus();
   ui.updateMemoryStatus();
+
+  // Initialize Chat UI (but don't load model yet)
+  chat.init();
+
+  // Initialize SAM and start loading models automatically
+  await sam.init();
 
   // Setup modal close handlers
   const modal = ui.$('dashboard-modal');

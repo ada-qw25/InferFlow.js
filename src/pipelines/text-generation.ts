@@ -3,17 +3,56 @@
  * 
  * Autoregressive text generation with streaming support.
  * Supports GPT-2, LLaMA, Mistral, and other causal LM models.
+ * Includes chat/conversation support with message history.
  */
 
 import { BasePipeline, PipelineResult } from './base.js';
 import { Tokenizer } from '../utils/tokenizer.js';
 import { EdgeFlowTensor, softmax } from '../core/tensor.js';
-import { PipelineConfig, PipelineOptions } from '../core/types.js';
-import { runInference } from '../core/runtime.js';
+import { PipelineConfig, PipelineOptions, LoadedModel } from '../core/types.js';
+import { runInference, loadModelFromBuffer } from '../core/runtime.js';
+
+// ============================================================================
+// Default Model URLs (TinyLlama - quantized for browser)
+// ============================================================================
+
+const DEFAULT_LLM_MODELS = {
+  model: 'https://huggingface.co/Xenova/TinyLlama-1.1B-Chat-v1.0/resolve/main/onnx/model_q4f16.onnx',
+  tokenizer: 'https://huggingface.co/Xenova/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json',
+};
 
 // ============================================================================
 // Types
 // ============================================================================
+
+/**
+ * LLM model loading progress callback
+ */
+export interface LLMLoadProgress {
+  /** Stage: 'tokenizer' or 'model' */
+  stage: 'tokenizer' | 'model';
+  /** Bytes loaded */
+  loaded: number;
+  /** Total bytes */
+  total: number;
+  /** Progress percentage (0-100) */
+  progress: number;
+}
+
+/**
+ * Chat message
+ */
+export interface ChatMessage {
+  /** Role: 'system', 'user', or 'assistant' */
+  role: 'system' | 'user' | 'assistant';
+  /** Message content */
+  content: string;
+}
+
+/**
+ * Chat template type
+ */
+export type ChatTemplateType = 'chatml' | 'llama2' | 'llama3' | 'mistral' | 'phi3' | 'alpaca' | 'vicuna' | 'custom';
 
 /**
  * Text generation options
@@ -43,6 +82,26 @@ export interface TextGenerationOptions {
   returnFullText?: boolean;
   /** Callback for each generated token */
   onToken?: (token: string, tokenId: number) => void;
+}
+
+/**
+ * Chat generation options
+ */
+export interface ChatOptions extends TextGenerationOptions {
+  /** System prompt */
+  systemPrompt?: string;
+  /** Chat template type */
+  templateType?: ChatTemplateType;
+  /** Custom template (if templateType is 'custom') */
+  customTemplate?: {
+    systemPrefix?: string;
+    systemSuffix?: string;
+    userPrefix?: string;
+    userSuffix?: string;
+    assistantPrefix?: string;
+    assistantSuffix?: string;
+    separator?: string;
+  };
 }
 
 /**
@@ -97,12 +156,142 @@ export interface GenerationStreamEvent {
 export class TextGenerationPipeline extends BasePipeline<string | string[], TextGenerationResult | TextGenerationResult[]> {
   private tokenizer: Tokenizer | null = null;
   private eosTokenId: number = 50256; // GPT-2 default
+  private llmModel: LoadedModel | null = null;
+  private modelsLoaded: boolean = false;
+  
+  // Custom model URLs
+  private modelUrl: string;
+  private tokenizerUrl: string;
 
   constructor(config?: PipelineConfig) {
     super(config ?? {
       task: 'text-generation',
       model: 'default',
     });
+    this.modelUrl = DEFAULT_LLM_MODELS.model;
+    this.tokenizerUrl = DEFAULT_LLM_MODELS.tokenizer;
+  }
+
+  /**
+   * Check if model is loaded
+   */
+  get isModelLoaded(): boolean {
+    return this.modelsLoaded;
+  }
+
+  /**
+   * Set custom model URLs
+   */
+  setModelUrls(model: string, tokenizer: string): void {
+    this.modelUrl = model;
+    this.tokenizerUrl = tokenizer;
+  }
+
+  /**
+   * Load model and tokenizer with progress callback
+   */
+  async loadModel(
+    onProgress?: (progress: LLMLoadProgress) => void
+  ): Promise<void> {
+    if (this.modelsLoaded) return;
+
+    // Load tokenizer first (small, fast)
+    onProgress?.({ stage: 'tokenizer', loaded: 0, total: 100, progress: 0 });
+    
+    try {
+      const tokenizerResponse = await fetch(this.tokenizerUrl);
+      if (!tokenizerResponse.ok) {
+        throw new Error(`Failed to fetch tokenizer: ${tokenizerResponse.status}`);
+      }
+      const tokenizerJson = await tokenizerResponse.json();
+      this.tokenizer = await Tokenizer.fromJSON(tokenizerJson);
+      
+      const specialIds = this.tokenizer.getSpecialTokenIds();
+      this.eosTokenId = specialIds.eosTokenId ?? specialIds.sepTokenId ?? 2; // TinyLlama uses 2 as EOS
+      
+      onProgress?.({ stage: 'tokenizer', loaded: 100, total: 100, progress: 100 });
+    } catch (error) {
+      throw new Error(`Failed to load tokenizer: ${error}`);
+    }
+
+    // Load model with progress tracking
+    onProgress?.({ stage: 'model', loaded: 0, total: 100, progress: 0 });
+    
+    const modelData = await this.fetchModelWithProgress(
+      this.modelUrl,
+      (loaded, total) => {
+        onProgress?.({
+          stage: 'model',
+          loaded,
+          total,
+          progress: Math.round((loaded / total) * 100),
+        });
+      }
+    );
+    
+    this.llmModel = await loadModelFromBuffer(modelData, {
+      runtime: 'wasm',
+    });
+    this.model = this.llmModel;
+
+    this.modelsLoaded = true;
+  }
+
+  /**
+   * Fetch model with progress tracking
+   */
+  private async fetchModelWithProgress(
+    url: string,
+    onProgress: (loaded: number, total: number) => void
+  ): Promise<ArrayBuffer> {
+    const response = await fetch(url);
+    
+    if (!response.ok) {
+      throw new Error(`Failed to fetch model: ${response.status} ${response.statusText}`);
+    }
+
+    const contentLength = response.headers.get('content-length');
+    const total = contentLength ? parseInt(contentLength, 10) : 0;
+
+    if (!response.body) {
+      // Fallback if no streaming support
+      const buffer = await response.arrayBuffer();
+      onProgress(buffer.byteLength, buffer.byteLength);
+      return buffer;
+    }
+
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let loaded = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      
+      if (done) break;
+      
+      chunks.push(value);
+      loaded += value.length;
+      onProgress(loaded, total || loaded);
+    }
+
+    // Combine chunks into ArrayBuffer
+    const buffer = new Uint8Array(loaded);
+    let offset = 0;
+    for (const chunk of chunks) {
+      buffer.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    return buffer.buffer;
+  }
+
+  /**
+   * Initialize pipeline (override to skip default model loading)
+   */
+  override async initialize(): Promise<void> {
+    if (this.isReady) return;
+    // Don't call super.initialize() - we handle model loading separately
+    this.isReady = true;
   }
 
   /**
@@ -496,6 +685,370 @@ export class TextGenerationPipeline extends BasePipeline<string | string[], Text
 
     // Fallback
     return candidateIndices[0] ?? 0;
+  }
+
+  // ==========================================================================
+  // Chat / Conversation Support
+  // ==========================================================================
+
+  private conversationHistory: ChatMessage[] = [];
+  private chatTemplateType: ChatTemplateType = 'chatml';
+
+  /**
+   * Set the chat template type
+   */
+  setChatTemplate(templateType: ChatTemplateType): void {
+    this.chatTemplateType = templateType;
+  }
+
+  /**
+   * Apply chat template to messages
+   */
+  applyChatTemplate(messages: ChatMessage[], options?: ChatOptions): string {
+    const templateType = options?.templateType ?? this.chatTemplateType;
+    
+    switch (templateType) {
+      case 'chatml':
+        return this.applyChatMLTemplate(messages);
+      case 'llama2':
+        return this.applyLlama2Template(messages);
+      case 'llama3':
+        return this.applyLlama3Template(messages);
+      case 'mistral':
+        return this.applyMistralTemplate(messages);
+      case 'phi3':
+        return this.applyPhi3Template(messages);
+      case 'alpaca':
+        return this.applyAlpacaTemplate(messages);
+      case 'vicuna':
+        return this.applyVicunaTemplate(messages);
+      case 'custom':
+        return this.applyCustomTemplate(messages, options?.customTemplate ?? {});
+      default:
+        return this.applyChatMLTemplate(messages);
+    }
+  }
+
+  /**
+   * ChatML template (used by many models including Qwen, Yi)
+   */
+  private applyChatMLTemplate(messages: ChatMessage[]): string {
+    let prompt = '';
+    for (const msg of messages) {
+      prompt += `<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`;
+    }
+    prompt += '<|im_start|>assistant\n';
+    return prompt;
+  }
+
+  /**
+   * Llama 2 template
+   */
+  private applyLlama2Template(messages: ChatMessage[]): string {
+    let prompt = '';
+    let systemMsg = '';
+    
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        systemMsg = msg.content;
+      } else if (msg.role === 'user') {
+        if (systemMsg) {
+          prompt += `<s>[INST] <<SYS>>\n${systemMsg}\n<</SYS>>\n\n${msg.content} [/INST]`;
+          systemMsg = '';
+        } else {
+          prompt += `<s>[INST] ${msg.content} [/INST]`;
+        }
+      } else if (msg.role === 'assistant') {
+        prompt += ` ${msg.content} </s>`;
+      }
+    }
+    
+    return prompt;
+  }
+
+  /**
+   * Llama 3 template
+   */
+  private applyLlama3Template(messages: ChatMessage[]): string {
+    let prompt = '<|begin_of_text|>';
+    
+    for (const msg of messages) {
+      prompt += `<|start_header_id|>${msg.role}<|end_header_id|>\n\n${msg.content}<|eot_id|>`;
+    }
+    
+    prompt += '<|start_header_id|>assistant<|end_header_id|>\n\n';
+    return prompt;
+  }
+
+  /**
+   * Mistral template
+   */
+  private applyMistralTemplate(messages: ChatMessage[]): string {
+    let prompt = '<s>';
+    
+    for (const msg of messages) {
+      if (msg.role === 'user') {
+        prompt += `[INST] ${msg.content} [/INST]`;
+      } else if (msg.role === 'assistant') {
+        prompt += ` ${msg.content}</s>`;
+      } else if (msg.role === 'system') {
+        prompt += `[INST] ${msg.content}\n`;
+      }
+    }
+    
+    return prompt;
+  }
+
+  /**
+   * Phi-3 template
+   */
+  private applyPhi3Template(messages: ChatMessage[]): string {
+    let prompt = '';
+    
+    for (const msg of messages) {
+      prompt += `<|${msg.role}|>\n${msg.content}<|end|>\n`;
+    }
+    
+    prompt += '<|assistant|>\n';
+    return prompt;
+  }
+
+  /**
+   * Alpaca template
+   */
+  private applyAlpacaTemplate(messages: ChatMessage[]): string {
+    let prompt = '';
+    let instruction = '';
+    let input = '';
+    
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        instruction = msg.content;
+      } else if (msg.role === 'user') {
+        input = msg.content;
+      }
+    }
+    
+    if (instruction) {
+      prompt = `### Instruction:\n${instruction}\n\n`;
+    }
+    if (input) {
+      prompt += `### Input:\n${input}\n\n`;
+    }
+    prompt += '### Response:\n';
+    
+    return prompt;
+  }
+
+  /**
+   * Vicuna template
+   */
+  private applyVicunaTemplate(messages: ChatMessage[]): string {
+    let prompt = '';
+    
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        prompt += `${msg.content}\n\n`;
+      } else if (msg.role === 'user') {
+        prompt += `USER: ${msg.content}\n`;
+      } else if (msg.role === 'assistant') {
+        prompt += `ASSISTANT: ${msg.content}\n`;
+      }
+    }
+    
+    prompt += 'ASSISTANT:';
+    return prompt;
+  }
+
+  /**
+   * Custom template
+   */
+  private applyCustomTemplate(
+    messages: ChatMessage[],
+    template: NonNullable<ChatOptions['customTemplate']>
+  ): string {
+    const {
+      systemPrefix = '',
+      systemSuffix = '\n',
+      userPrefix = 'User: ',
+      userSuffix = '\n',
+      assistantPrefix = 'Assistant: ',
+      assistantSuffix = '\n',
+      separator = '',
+    } = template;
+    
+    let prompt = '';
+    
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i]!;
+      if (i > 0) prompt += separator;
+      
+      switch (msg.role) {
+        case 'system':
+          prompt += `${systemPrefix}${msg.content}${systemSuffix}`;
+          break;
+        case 'user':
+          prompt += `${userPrefix}${msg.content}${userSuffix}`;
+          break;
+        case 'assistant':
+          prompt += `${assistantPrefix}${msg.content}${assistantSuffix}`;
+          break;
+      }
+    }
+    
+    prompt += assistantPrefix;
+    return prompt;
+  }
+
+  /**
+   * Chat with the model
+   * 
+   * @example
+   * ```typescript
+   * const generator = await pipeline('text-generation', 'model');
+   * 
+   * // Single turn
+   * const response = await generator.chat('Hello, how are you?');
+   * 
+   * // Multi-turn with history
+   * const response1 = await generator.chat('What is AI?');
+   * const response2 = await generator.chat('Can you give an example?');
+   * 
+   * // With system prompt
+   * const response = await generator.chat('Hello', {
+   *   systemPrompt: 'You are a helpful assistant.',
+   * });
+   * ```
+   */
+  async chat(
+    userMessage: string,
+    options?: ChatOptions
+  ): Promise<TextGenerationResult> {
+    // Add system message if provided and not already present
+    if (options?.systemPrompt && 
+        (this.conversationHistory.length === 0 || this.conversationHistory[0]?.role !== 'system')) {
+      this.conversationHistory.unshift({
+        role: 'system',
+        content: options.systemPrompt,
+      });
+    }
+
+    // Add user message
+    this.conversationHistory.push({
+      role: 'user',
+      content: userMessage,
+    });
+
+    // Apply chat template
+    const prompt = this.applyChatTemplate(this.conversationHistory, options);
+
+    // Generate response
+    const result = await this.run(prompt, {
+      ...options,
+      stopSequences: [
+        ...(options?.stopSequences ?? []),
+        '<|im_end|>',
+        '<|end|>',
+        '<|eot_id|>',
+        '</s>',
+        '\n\nUser:',
+        '\n\nHuman:',
+      ],
+    });
+
+    // Add assistant response to history
+    const response = Array.isArray(result) ? result[0]! : result;
+    this.conversationHistory.push({
+      role: 'assistant',
+      content: response.generatedText.trim(),
+    });
+
+    return response;
+  }
+
+  /**
+   * Stream chat response
+   */
+  async *chatStream(
+    userMessage: string,
+    options?: ChatOptions
+  ): AsyncGenerator<GenerationStreamEvent> {
+    // Add system message if provided
+    if (options?.systemPrompt && 
+        (this.conversationHistory.length === 0 || this.conversationHistory[0]?.role !== 'system')) {
+      this.conversationHistory.unshift({
+        role: 'system',
+        content: options.systemPrompt,
+      });
+    }
+
+    // Add user message
+    this.conversationHistory.push({
+      role: 'user',
+      content: userMessage,
+    });
+
+    // Apply chat template
+    const prompt = this.applyChatTemplate(this.conversationHistory, options);
+
+    // Stream response
+    let fullResponse = '';
+    for await (const event of this.stream(prompt, {
+      ...options,
+      stopSequences: [
+        ...(options?.stopSequences ?? []),
+        '<|im_end|>',
+        '<|end|>',
+        '<|eot_id|>',
+        '</s>',
+      ],
+    })) {
+      fullResponse = event.generatedText;
+      yield event;
+    }
+
+    // Add assistant response to history
+    this.conversationHistory.push({
+      role: 'assistant',
+      content: fullResponse.trim(),
+    });
+  }
+
+  /**
+   * Get conversation history
+   */
+  getConversationHistory(): ChatMessage[] {
+    return [...this.conversationHistory];
+  }
+
+  /**
+   * Set conversation history
+   */
+  setConversationHistory(messages: ChatMessage[]): void {
+    this.conversationHistory = [...messages];
+  }
+
+  /**
+   * Clear conversation history
+   */
+  clearConversation(): void {
+    this.conversationHistory = [];
+  }
+
+  /**
+   * Remove last exchange (user message + assistant response)
+   */
+  undoLastExchange(): void {
+    // Remove assistant message
+    if (this.conversationHistory.length > 0 && 
+        this.conversationHistory[this.conversationHistory.length - 1]?.role === 'assistant') {
+      this.conversationHistory.pop();
+    }
+    // Remove user message
+    if (this.conversationHistory.length > 0 && 
+        this.conversationHistory[this.conversationHistory.length - 1]?.role === 'user') {
+      this.conversationHistory.pop();
+    }
   }
 
 }

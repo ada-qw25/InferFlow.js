@@ -55,6 +55,10 @@ export {
   type TextGenerationOptions,
   type TextGenerationResult,
   type GenerationStreamEvent,
+  type ChatMessage,
+  type ChatOptions,
+  type ChatTemplateType,
+  type LLMLoadProgress,
 } from './text-generation.js';
 
 // Object Detection
@@ -94,6 +98,17 @@ export {
   type QAInput,
 } from './question-answering.js';
 
+// Image Segmentation
+export {
+  ImageSegmentationPipeline,
+  createImageSegmentationPipeline,
+  type ImageSegmentationOptions,
+  type ImageSegmentationResult,
+  type PointPrompt,
+  type BoxPrompt,
+  type ModelLoadProgress,
+} from './image-segmentation.js';
+
 // ============================================================================
 // High-Level Pipeline Factory
 // ============================================================================
@@ -127,6 +142,7 @@ type PipelineTaskMap = {
   'automatic-speech-recognition': AutomaticSpeechRecognitionPipeline;
   'zero-shot-classification': ZeroShotClassificationPipeline;
   'question-answering': QuestionAnsweringPipeline;
+  'image-segmentation': ImageSegmentationPipeline;
 };
 
 // Import pipeline classes
@@ -138,6 +154,7 @@ import { ObjectDetectionPipeline } from './object-detection.js';
 import { AutomaticSpeechRecognitionPipeline } from './automatic-speech-recognition.js';
 import { ZeroShotClassificationPipeline } from './zero-shot-classification.js';
 import { QuestionAnsweringPipeline } from './question-answering.js';
+import { ImageSegmentationPipeline } from './image-segmentation.js';
 
 /**
  * Create a pipeline for a specific task
@@ -166,7 +183,7 @@ export async function pipeline<T extends keyof PipelineTaskMap>(
     quantization: options?.quantization,
   };
 
-  type AllPipelines = TextClassificationPipeline | SentimentAnalysisPipeline | FeatureExtractionPipeline | ImageClassificationPipeline | TextGenerationPipeline | ObjectDetectionPipeline | AutomaticSpeechRecognitionPipeline | ZeroShotClassificationPipeline | QuestionAnsweringPipeline;
+  type AllPipelines = TextClassificationPipeline | SentimentAnalysisPipeline | FeatureExtractionPipeline | ImageClassificationPipeline | TextGenerationPipeline | ObjectDetectionPipeline | AutomaticSpeechRecognitionPipeline | ZeroShotClassificationPipeline | QuestionAnsweringPipeline | ImageSegmentationPipeline;
   
   let pipelineInstance: AllPipelines;
 
@@ -197,6 +214,9 @@ export async function pipeline<T extends keyof PipelineTaskMap>(
       break;
     case 'question-answering':
       pipelineInstance = new QuestionAnsweringPipeline(config);
+      break;
+    case 'image-segmentation':
+      pipelineInstance = new ImageSegmentationPipeline(config);
       break;
     default:
       throw new Error(`Unknown pipeline task: ${task}`);
