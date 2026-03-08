@@ -1167,17 +1167,17 @@ const chat = {
       
       // Load model with progress
       await state.chatPipeline.loadModel((progressInfo) => {
-        const { stage, progress: pct, loaded, total } = progressInfo;
+        const { stage, progress: pct } = progressInfo;
         
         if (loadBtn) {
           if (stage === 'tokenizer') {
             loadBtn.textContent = 'Loading tokenizer...';
           } else {
-            loadBtn.textContent = `Loading model... ${utils.formatBytes(loaded)}`;
+            loadBtn.textContent = `Downloading... ${pct}%`;
           }
         }
         if (loaderDetail) {
-          loaderDetail.textContent = `${stage}: ${pct}%`;
+          loaderDetail.classList.add('hidden');
         }
         if (progress) {
           // Tokenizer is quick, model is the main download
@@ -1240,20 +1240,27 @@ const chat = {
     
     try {
       // Add assistant message placeholder
-      const assistantMsg = this.addMessage('assistant', '', true);
+      const assistantMsg = this.addMessage('assistant', 'Thinking...', true);
       
       // Generate response using real model
+      // Note: TinyLlama in WASM is slow, limit tokens for demo
       let response = '';
+      let tokenCount = 0;
       
-      // Use streaming if available
+      console.log('[Chat] Starting generation...');
+      const startTime = performance.now();
+      
+      // Use streaming for real-time feedback
       if (state.chatPipeline.chatStream) {
         for await (const event of state.chatPipeline.chatStream(message, {
-          maxNewTokens: 256,
+          maxNewTokens: 32, // Limited for browser performance
           temperature: 0.7,
           topP: 0.9,
         })) {
           response = event.generatedText;
+          tokenCount++;
           assistantMsg.textContent = response;
+          this.updateStatus('loading', `Generating... (${tokenCount} tokens)`);
           
           // Scroll to bottom
           const container = ui.$('chat-messages');
@@ -1263,14 +1270,19 @@ const chat = {
         }
       } else {
         // Fallback to non-streaming
+        this.updateStatus('loading', 'Generating (this may take a while)...');
         const result = await state.chatPipeline.chat(message, {
-          maxNewTokens: 256,
+          maxNewTokens: 32, // Limited for browser performance
           temperature: 0.7,
           topP: 0.9,
         });
         response = result.generatedText;
+        tokenCount = result.numTokens;
         assistantMsg.textContent = response;
       }
+      
+      const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+      console.log(`[Chat] Generated ${tokenCount} tokens in ${elapsed}s`);
       
       // Remove typing indicator
       assistantMsg.classList.remove('typing');

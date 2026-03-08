@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>edgeFlow.js — Offline AI Notepad</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #fafaf9;
+      --surface: #ffffff;
+      --border: #e7e5e4;
+      --text: #1c1917;
+      --muted: #78716c;
+      --accent: #7c3aed;
+      --green: #059669;
+      --radius: 10px;
+    }
+
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      max-width: 700px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem;
+      min-height: 100vh;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 2rem;
+    }
+
+    h1 { font-size: 1.25rem; }
+
+    .status {
+      font-size: 0.75rem;
+      padding: 4px 10px;
+      border-radius: 99px;
+      font-weight: 600;
+    }
+    .status.online  { background: #d1fae5; color: var(--green); }
+    .status.offline { background: #fef3c7; color: #92400e; }
+
+    textarea {
+      width: 100%;
+      min-height: 200px;
+      padding: 1rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-family: inherit;
+      font-size: 0.95rem;
+      resize: vertical;
+      line-height: 1.7;
+      background: var(--surface);
+    }
+    textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+    .actions {
+      display: flex;
+      gap: 0.75rem;
+      margin-top: 1rem;
+    }
+
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 0.6rem 1.2rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { opacity: 0.9; }
+    button.secondary {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .result {
+      margin-top: 1.5rem;
+      padding: 1rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 0.85rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      min-height: 60px;
+    }
+
+    .result h3 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      margin-bottom: 0.5rem;
+    }
+
+    .info {
+      margin-top: 2rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Offline AI Notepad</h1>
+    <span class="status" id="status">checking...</span>
+  </header>
+
+  <textarea id="editor" placeholder="Write something and let AI analyze it...">edgeFlow.js makes browser ML inference production-ready with task scheduling, memory management, and smart caching.</textarea>
+
+  <div class="actions">
+    <button onclick="analyze()">Analyze Text</button>
+    <button onclick="summarize()" class="secondary">Auto-complete</button>
+    <button onclick="clearResult()" class="secondary">Clear</button>
+  </div>
+
+  <div class="result" id="result">
+    <h3>AI Analysis</h3>
+    <span id="result-text">Click "Analyze Text" to start.</span>
+  </div>
+
+  <div class="info">
+    <strong>How this works:</strong> All ML inference runs entirely in your browser.
+    Models are cached in IndexedDB after first download — the notepad works offline after that.
+    edgeFlow.js handles scheduling, memory, and caching automatically.
+  </div>
+
+  <script type="module">
+    import * as edgeFlow from '/dist/edgeflow.browser.js';
+
+    // Network status
+    function updateStatus() {
+      const el = document.getElementById('status');
+      if (navigator.onLine) {
+        el.textContent = 'online';
+        el.className = 'status online';
+      } else {
+        el.textContent = 'offline';
+        el.className = 'status offline';
+      }
+    }
+    window.addEventListener('online', updateStatus);
+    window.addEventListener('offline', updateStatus);
+    updateStatus();
+
+    const resultEl = document.getElementById('result-text');
+
+    // Save to localStorage
+    const editor = document.getElementById('editor');
+    editor.value = localStorage.getItem('notepad-text') || editor.value;
+    editor.addEventListener('input', () => {
+      localStorage.setItem('notepad-text', editor.value);
+    });
+
+    window.analyze = async () => {
+      const text = editor.value.trim();
+      if (!text) return;
+
+      resultEl.textContent = 'Analyzing...';
+
+      try {
+        const classifier = await edgeFlow.pipeline('sentiment-analysis');
+        const result = await classifier.run(text);
+        const stats = edgeFlow.getMemoryStats();
+
+        resultEl.textContent =
+          `Sentiment: ${result.label} (${(result.score * 100).toFixed(1)}%)\n` +
+          `Processing time: ${result.processingTime?.toFixed(1)}ms\n` +
+          `Memory: ${(stats.allocated / 1024).toFixed(0)} KB allocated, ${stats.tensorCount} tensors\n\n` +
+          `Word count: ${text.split(/\s+/).length}\n` +
+          `Character count: ${text.length}`;
+      } catch (err) {
+        resultEl.textContent = `Error: ${err.message}`;
+      }
+    };
+
+    window.summarize = async () => {
+      const text = editor.value.trim();
+      if (!text) return;
+
+      resultEl.textContent = 'Loading text generation model (this may take a moment on first run)...';
+
+      try {
+        const generator = await edgeFlow.pipeline('text-generation');
+        const prompt = text.slice(-100); // last 100 chars as prompt
+        const result = await generator.run(prompt, {
+          maxNewTokens: 30,
+          temperature: 0.7,
+        });
+
+        if (result && result.generatedText) {
+          editor.value += result.generatedText;
+          localStorage.setItem('notepad-text', editor.value);
+          resultEl.textContent = `Generated ${result.generatedText.length} characters.`;
+        } else {
+          resultEl.textContent = 'Model loaded but no output generated.';
+        }
+      } catch (err) {
+        resultEl.textContent = `Error: ${err.message}`;
+      }
+    };
+
+    window.clearResult = () => {
+      resultEl.textContent = 'Click "Analyze Text" to start.';
+    };
+  </script>
+</body>
+</html>

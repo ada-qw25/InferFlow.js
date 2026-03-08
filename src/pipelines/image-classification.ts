@@ -45,11 +45,17 @@ export type ImageInput =
 
 /**
  * ImageClassificationPipeline - Classify images
+ * 
+ * **Status: Experimental** - Uses heuristic-based inference, not a real model.
+ * For production use, pair with the transformers.js adapter backend or
+ * provide a real ONNX model.
  */
 export class ImageClassificationPipeline extends BasePipeline<
   ImageInput | ImageInput[],
   ImageClassificationResult | ImageClassificationResult[]
 > {
+  static readonly experimental = true;
+
   private preprocessor: ImagePreprocessor | null = null;
   private labels: string[];
   private numClasses: number;
@@ -72,6 +78,14 @@ export class ImageClassificationPipeline extends BasePipeline<
     
     if (!this.preprocessor) {
       this.preprocessor = createImagePreprocessor('imagenet');
+    }
+
+    if (this.config.model === 'default') {
+      console.warn(
+        '[edgeFlow.js] ImageClassificationPipeline is running in experimental mode ' +
+        'with heuristic-based inference. For production accuracy, provide a real ' +
+        'ONNX model or use the transformers.js adapter backend.'
+      );
     }
   }
 

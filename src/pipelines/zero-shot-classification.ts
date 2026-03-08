@@ -65,10 +65,17 @@ export interface ZeroShotInput {
   candidateLabels: string[];
 }
 
+/**
+ * **Status: Experimental** - Uses random scoring, not a real NLI model.
+ * For production use, pair with the transformers.js adapter backend or
+ * provide a real ONNX NLI model.
+ */
 export class ZeroShotClassificationPipeline extends BasePipeline<
   ZeroShotInput,
   ZeroShotClassificationResult | ZeroShotClassificationResult[]
 > {
+  static readonly experimental = true;
+
   private tokenizer: Tokenizer | null = null;
   private hypothesisTemplate: string = 'This text is about {label}.';
 

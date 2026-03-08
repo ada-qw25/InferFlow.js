@@ -36,11 +36,17 @@ export interface TextClassificationOptions extends PipelineOptions {
 
 /**
  * TextClassificationPipeline - Classify text into categories
+ * 
+ * **Status: Experimental** - Uses heuristic-based inference, not a real model.
+ * Results are approximate. For production use, pair with the transformers.js
+ * adapter backend or wait for full ONNX model support.
  */
 export class TextClassificationPipeline extends BasePipeline<
   string | string[],
   TextClassificationResult | TextClassificationResult[]
 > {
+  static readonly experimental = true;
+
   private tokenizer: Tokenizer | null = null;
   private labels: string[];
 
@@ -55,9 +61,16 @@ export class TextClassificationPipeline extends BasePipeline<
   override async initialize(): Promise<void> {
     await super.initialize();
     
-    // Initialize tokenizer
     if (!this.tokenizer) {
       this.tokenizer = createBasicTokenizer();
+    }
+
+    if (this.config.model === 'default') {
+      console.warn(
+        '[edgeFlow.js] TextClassificationPipeline is running in experimental mode ' +
+        'with heuristic-based inference. For production accuracy, provide a real ' +
+        'ONNX model or use the transformers.js adapter backend.'
+      );
     }
   }
 

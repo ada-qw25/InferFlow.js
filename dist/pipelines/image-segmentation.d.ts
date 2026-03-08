@@ -104,6 +104,7 @@ export declare class ImageSegmentationPipeline extends BasePipeline<ImageInput, 
     private encoderModel;
     private decoderModel;
     private imageEmbedding;
+    private imagePositionalEmbedding;
     private currentImageSize;
     private resizedImageSize;
     private inputSize;
@@ -176,7 +177,16 @@ export declare class ImageSegmentationPipeline extends BasePipeline<ImageInput, 
      */
     private preprocessImage;
     /**
-     * Prepare decoder inputs (prompts)
+     * Prepare decoder inputs (prompts) for SlimSAM
+     *
+     * SlimSAM prompt_encoder_mask_decoder expects these named inputs:
+     * - image_embeddings: [1, 256, 64, 64]
+     * - point_coords: [batch, num_points, 2]
+     * - point_labels: [batch, num_points]
+     * - mask_input: [batch, 1, 256, 256]
+     * - has_mask_input: [batch, 1]
+     * - orig_im_size: [2]
+     * - position_ids: [batch, num_points]
      */
     private prepareDecoderInputs;
     /**

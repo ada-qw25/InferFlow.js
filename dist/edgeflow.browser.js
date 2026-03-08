@@ -2487,6 +2487,19 @@ async function runInference(model, inputs) {
   const task = scheduler.schedule(model.id, () => runtime.run(model, inputs));
   return task.wait();
 }
+async function runInferenceNamed(model, namedInputs) {
+  if (!model.isLoaded) {
+    throw new EdgeFlowError("Model has been disposed", ErrorCodes.MODEL_NOT_LOADED, { modelId: model.id });
+  }
+  const manager = RuntimeManager.getInstance();
+  const runtime = await manager.getRuntime(model.runtime);
+  if (!("runNamed" in runtime)) {
+    throw new EdgeFlowError("Runtime does not support named inputs", ErrorCodes.INFERENCE_FAILED, { modelId: model.id });
+  }
+  const scheduler = getScheduler();
+  const task = scheduler.schedule(model.id, () => runtime.runNamed(model, namedInputs));
+  return task.wait();
+}
 async function runBatchInference(model, batches) {
   const scheduler = getScheduler();
   const manager = RuntimeManager.getInstance();
@@ -3331,7 +3344,6 @@ var ONNXRuntime = class {
     if (typeof window !== "undefined") {
       ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/";
     }
-    this.executionProvider = "wasm";
     this.initialized = true;
   }
   /**
@@ -3343,11 +3355,24 @@ var ONNXRuntime = class {
     }
     try {
       const sessionOptions = {
-        executionProviders: [this.executionProvider],
+        executionProviders: ["webgpu", "wasm"],
+        // Try WebGPU first, fallback to WASM
         graphOptimizationLevel: "all"
       };
       const modelBytes = new Uint8Array(modelData);
-      const session = await ort.InferenceSession.create(modelBytes, sessionOptions);
+      let session;
+      try {
+        session = await ort.InferenceSession.create(modelBytes, sessionOptions);
+        console.log("[ONNX] Session created (tried WebGPU \u2192 WASM)");
+      } catch (e) {
+        console.log("[ONNX] WebGPU not available, falling back to WASM. Reason:", e instanceof Error ? e.message : e);
+        const wasmOptions = {
+          executionProviders: ["wasm"],
+          graphOptimizationLevel: "all"
+        };
+        session = await ort.InferenceSession.create(modelBytes, wasmOptions);
+        console.log("[ONNX] Session created with WASM backend");
+      }
       const inputNames = session.inputNames;
       const outputNames = session.outputNames;
       const modelId = `onnx_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -3424,6 +3449,53 @@ var ONNXRuntime = class {
       }
       return outputs;
     } catch (error) {
+      throw new EdgeFlowError(`ONNX inference failed: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INFERENCE_FAILED, { modelId: model.id, error });
+    }
+  }
+  /**
+   * Run inference with named inputs
+   */
+  async runNamed(model, namedInputs) {
+    const sessionData = sessionStore.get(model.id);
+    if (!sessionData) {
+      throw new EdgeFlowError(`ONNX session not found for model ${model.id}`, ErrorCodes.MODEL_NOT_LOADED, { modelId: model.id });
+    }
+    const { session, inputNames, outputNames } = sessionData;
+    try {
+      const feeds = {};
+      console.log("[ONNX] Model expects inputs:", inputNames);
+      console.log("[ONNX] Provided inputs:", Array.from(namedInputs.keys()));
+      for (const [inputName, inputTensor] of namedInputs) {
+        const tensor2 = inputTensor;
+        const dtype = tensor2.dtype;
+        let ortTensor;
+        if (dtype === "int64") {
+          const data = tensor2.data;
+          ortTensor = new ort.Tensor("int64", data, tensor2.shape);
+        } else if (dtype === "int32") {
+          const data = tensor2.data;
+          ortTensor = new ort.Tensor("int32", data, tensor2.shape);
+        } else {
+          const data = tensor2.toFloat32Array();
+          ortTensor = new ort.Tensor("float32", data, tensor2.shape);
+        }
+        feeds[inputName] = ortTensor;
+        console.log(`[ONNX] Input '${inputName}': shape=${tensor2.shape}, dtype=${dtype}`);
+      }
+      const results = await session.run(feeds);
+      const outputs = [];
+      for (const outputName of outputNames) {
+        const ortTensor = results[outputName];
+        if (ortTensor) {
+          const data = ortTensor.data;
+          const shape = Array.from(ortTensor.dims).map((d) => Number(d));
+          outputs.push(new EdgeFlowTensor(new Float32Array(data), shape, "float32"));
+        }
+      }
+      return outputs;
+    } catch (error) {
+      console.error("[ONNX] Inference failed. Model expects:", inputNames);
+      console.error("[ONNX] Provided:", Array.from(namedInputs.keys()));
       throw new EdgeFlowError(`ONNX inference failed: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INFERENCE_FAILED, { modelId: model.id, error });
     }
   }
@@ -5590,6 +5662,7 @@ var TextGenerationPipeline = class extends BasePipeline {
     });
     this.llmModel = await loadModelFromBuffer(modelData, {
       runtime: "wasm"
+      // Uses ONNXRuntime which auto-detects WebGPU internally
     });
     this.model = this.llmModel;
     this.modelsLoaded = true;
@@ -5791,9 +5864,19 @@ var TextGenerationPipeline = class extends BasePipeline {
     if (!this.model) {
       throw new Error("Model not loaded");
     }
-    const inputTensor = new EdgeFlowTensor(BigInt64Array.from(inputIds.map((id) => BigInt(id))), [1, inputIds.length], "int64");
-    const attentionMask = new EdgeFlowTensor(BigInt64Array.from(inputIds.map(() => BigInt(1))), [1, inputIds.length], "int64");
-    const outputs = await runInference(this.model, [inputTensor, attentionMask]);
+    const seqLen = inputIds.length;
+    const inputs = /* @__PURE__ */ new Map();
+    inputs.set("input_ids", new EdgeFlowTensor(BigInt64Array.from(inputIds.map((id) => BigInt(id))), [1, seqLen], "int64"));
+    inputs.set("attention_mask", new EdgeFlowTensor(BigInt64Array.from(inputIds.map(() => BigInt(1))), [1, seqLen], "int64"));
+    inputs.set("position_ids", new EdgeFlowTensor(BigInt64Array.from(Array.from({ length: seqLen }, (_, i) => BigInt(i))), [1, seqLen], "int64"));
+    const numLayers = 22;
+    const numKVHeads = 4;
+    const headDim = 64;
+    for (let i = 0; i < numLayers; i++) {
+      inputs.set(`past_key_values.${i}.key`, new EdgeFlowTensor(new Float32Array(0), [1, numKVHeads, 0, headDim], "float32"));
+      inputs.set(`past_key_values.${i}.value`, new EdgeFlowTensor(new Float32Array(0), [1, numKVHeads, 0, headDim], "float32"));
+    }
+    const outputs = await runInferenceNamed(this.model, inputs);
     if (!outputs || outputs.length === 0) {
       throw new Error("Model returned no outputs");
     }
@@ -6850,6 +6933,7 @@ var ImageSegmentationPipeline = class extends BasePipeline {
     __publicField(this, "encoderModel", null);
     __publicField(this, "decoderModel", null);
     __publicField(this, "imageEmbedding", null);
+    __publicField(this, "imagePositionalEmbedding", null);
     __publicField(this, "currentImageSize", null);
     __publicField(this, "resizedImageSize", null);
     __publicField(this, "inputSize", 1024);
@@ -6891,6 +6975,7 @@ var ImageSegmentationPipeline = class extends BasePipeline {
     });
     this.encoderModel = await loadModelFromBuffer(encoderData, {
       runtime: "wasm"
+      // Uses ONNXRuntime which auto-detects WebGPU internally
     });
     onProgress?.({ model: "decoder", loaded: 0, total: 100, progress: 0 });
     const decoderData = await this.fetchModelWithProgress(this.decoderUrl, (loaded, total) => {
@@ -6903,6 +6988,7 @@ var ImageSegmentationPipeline = class extends BasePipeline {
     });
     this.decoderModel = await loadModelFromBuffer(decoderData, {
       runtime: "wasm"
+      // Uses ONNXRuntime which auto-detects WebGPU internally
     });
     this.modelsLoaded = true;
   }
@@ -6981,6 +7067,12 @@ var ImageSegmentationPipeline = class extends BasePipeline {
     if (this.encoderModel) {
       const outputs = await runInference(this.encoderModel, [inputTensor]);
       this.imageEmbedding = outputs[0];
+      this.imagePositionalEmbedding = outputs[1];
+      console.log("[SAM] Encoder outputs:", outputs.length);
+      console.log("[SAM] image_embeddings shape:", this.imageEmbedding.shape);
+      if (this.imagePositionalEmbedding) {
+        console.log("[SAM] image_positional_embeddings shape:", this.imagePositionalEmbedding.shape);
+      }
     } else {
       throw new Error("Encoder model not loaded");
     }
@@ -6998,10 +7090,13 @@ var ImageSegmentationPipeline = class extends BasePipeline {
     const startTime = performance.now();
     const { points = [], boxes = [], maskThreshold = 0, returnAllMasks = false } = options;
     const decoderInputs = this.prepareDecoderInputs(points, boxes);
-    const outputs = await runInference(this.decoderModel, [
-      this.imageEmbedding,
-      ...decoderInputs
-    ]);
+    decoderInputs.set("image_embeddings", this.imageEmbedding);
+    if (this.imagePositionalEmbedding) {
+      decoderInputs.set("image_positional_embeddings", this.imagePositionalEmbedding);
+    } else {
+      throw new Error("image_positional_embeddings not available from encoder");
+    }
+    const outputs = await runInferenceNamed(this.decoderModel, decoderInputs);
     const masks = outputs[0];
     const scores = outputs[1];
     const result = this.postprocessMasks(masks, scores, maskThreshold, returnAllMasks);
@@ -7116,11 +7211,19 @@ var ImageSegmentationPipeline = class extends BasePipeline {
     };
   }
   /**
-   * Prepare decoder inputs (prompts)
+   * Prepare decoder inputs (prompts) for SlimSAM
+   *
+   * SlimSAM prompt_encoder_mask_decoder expects these named inputs:
+   * - image_embeddings: [1, 256, 64, 64]
+   * - point_coords: [batch, num_points, 2]
+   * - point_labels: [batch, num_points]
+   * - mask_input: [batch, 1, 256, 256]
+   * - has_mask_input: [batch, 1]
+   * - orig_im_size: [2]
+   * - position_ids: [batch, num_points]
    */
   prepareDecoderInputs(points, boxes) {
     const { width: resizedW, height: resizedH } = this.resizedImageSize;
-    const { width: origW, height: origH } = this.currentImageSize;
     const scaleX = resizedW;
     const scaleY = resizedH;
     const allPoints = [];
@@ -7140,10 +7243,10 @@ var ImageSegmentationPipeline = class extends BasePipeline {
       allLabels.push(1);
     }
     const numPoints = allLabels.length;
-    const pointCoords = new EdgeFlowTensor(new Float32Array(allPoints), [1, 1, numPoints, 2], "float32");
-    const pointLabels = new EdgeFlowTensor(BigInt64Array.from(allLabels.map((l) => BigInt(l))), [1, 1, numPoints], "int64");
-    const origImSize = new EdgeFlowTensor(BigInt64Array.from([BigInt(origH), BigInt(origW)]), [2], "int64");
-    return [pointCoords, pointLabels, origImSize];
+    const inputs = /* @__PURE__ */ new Map();
+    inputs.set("input_points", new EdgeFlowTensor(new Float32Array(allPoints), [1, 1, numPoints, 2], "float32"));
+    inputs.set("input_labels", new EdgeFlowTensor(BigInt64Array.from(allLabels.map((l) => BigInt(l))), [1, 1, numPoints], "int64"));
+    return inputs;
   }
   /**
    * Post-process masks from decoder output
@@ -7215,6 +7318,7 @@ var ImageSegmentationPipeline = class extends BasePipeline {
    */
   clearImage() {
     this.imageEmbedding = null;
+    this.imagePositionalEmbedding = null;
     this.currentImageSize = null;
     this.resizedImageSize = null;
   }
@@ -7245,6 +7349,7 @@ var ImageSegmentationPipeline = class extends BasePipeline {
     this.encoderModel?.dispose();
     this.decoderModel?.dispose();
     this.imageEmbedding = null;
+    this.imagePositionalEmbedding = null;
     this.currentImageSize = null;
     this.resizedImageSize = null;
     this.modelsLoaded = false;

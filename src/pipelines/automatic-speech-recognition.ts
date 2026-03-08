@@ -87,7 +87,14 @@ export interface ASRResult extends PipelineResult {
  * }
  * ```
  */
+/**
+ * **Status: Experimental** - Audio preprocessing works, but decoding is a stub.
+ * For production use, pair with the transformers.js adapter backend or
+ * provide a real Whisper ONNX model.
+ */
 export class AutomaticSpeechRecognitionPipeline extends BasePipeline<AudioInput | AudioInput[], ASRResult | ASRResult[]> {
+  static readonly experimental = true;
+
   private audioPreprocessor: AudioPreprocessor;
   private tokenizer: Tokenizer | null = null;
 

@@ -311,6 +311,24 @@ export async function runInference(model, inputs) {
     return task.wait();
 }
 /**
+ * Run inference with named inputs
+ */
+export async function runInferenceNamed(model, namedInputs) {
+    if (!model.isLoaded) {
+        throw new EdgeFlowError('Model has been disposed', ErrorCodes.MODEL_NOT_LOADED, { modelId: model.id });
+    }
+    const manager = RuntimeManager.getInstance();
+    const runtime = await manager.getRuntime(model.runtime);
+    // Check if runtime supports named inputs
+    if (!('runNamed' in runtime)) {
+        throw new EdgeFlowError('Runtime does not support named inputs', ErrorCodes.INFERENCE_FAILED, { modelId: model.id });
+    }
+    // Use scheduler for execution
+    const scheduler = getScheduler();
+    const task = scheduler.schedule(model.id, () => runtime.runNamed(model, namedInputs));
+    return task.wait();
+}
+/**
  * Run inference with batch processing
  */
 export async function runBatchInference(model, batches) {

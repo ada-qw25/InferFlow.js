@@ -1,11 +1,13 @@
 /**
  * edgeFlow.js - WebGPU Backend
  * 
- * High-performance WebGPU runtime for GPU-accelerated inference.
- * Features:
- * - Native concurrency support
- * - Efficient memory management
- * - Compute shader execution
+ * **Status: Planned** - This is a skeleton implementation that initializes
+ * WebGPU and creates compute pipelines but does not perform real model
+ * inference. For GPU-accelerated inference, use the ONNX Runtime backend
+ * which supports WebGPU via its execution providers.
+ * 
+ * This backend is intended for future custom WebGPU compute shader
+ * implementations that bypass ONNX Runtime for specialized ops.
  */
 
 import {

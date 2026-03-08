@@ -10,7 +10,7 @@ import { BasePipeline, PipelineResult } from './base.js';
 import { Tokenizer } from '../utils/tokenizer.js';
 import { EdgeFlowTensor, softmax } from '../core/tensor.js';
 import { PipelineConfig, PipelineOptions, LoadedModel } from '../core/types.js';
-import { runInference, loadModelFromBuffer } from '../core/runtime.js';
+import { runInferenceNamed, loadModelFromBuffer } from '../core/runtime.js';
 
 // ============================================================================
 // Default Model URLs (TinyLlama - quantized for browser)
@@ -230,7 +230,7 @@ export class TextGenerationPipeline extends BasePipeline<string | string[], Text
     );
     
     this.llmModel = await loadModelFromBuffer(modelData, {
-      runtime: 'wasm',
+      runtime: 'wasm', // Uses ONNXRuntime which auto-detects WebGPU internally
     });
     this.model = this.llmModel;
 
@@ -556,22 +556,55 @@ export class TextGenerationPipeline extends BasePipeline<string | string[], Text
       throw new Error('Model not loaded');
     }
 
-    // Prepare input tensor
-    const inputTensor = new EdgeFlowTensor(
+    const seqLen = inputIds.length;
+
+    // Prepare named inputs
+    const inputs = new Map<string, EdgeFlowTensor>();
+
+    // input_ids: [1, seq_len]
+    inputs.set('input_ids', new EdgeFlowTensor(
       BigInt64Array.from(inputIds.map(id => BigInt(id))),
-      [1, inputIds.length],
+      [1, seqLen],
       'int64'
-    );
+    ));
 
-    // Create attention mask
-    const attentionMask = new EdgeFlowTensor(
+    // attention_mask: [1, seq_len]
+    inputs.set('attention_mask', new EdgeFlowTensor(
       BigInt64Array.from(inputIds.map(() => BigInt(1))),
-      [1, inputIds.length],
+      [1, seqLen],
       'int64'
-    );
+    ));
 
-    // Run inference
-    const outputs = await runInference(this.model, [inputTensor, attentionMask]);
+    // position_ids: [1, seq_len] - sequential positions from 0 to seq_len-1
+    inputs.set('position_ids', new EdgeFlowTensor(
+      BigInt64Array.from(Array.from({ length: seqLen }, (_, i) => BigInt(i))),
+      [1, seqLen],
+      'int64'
+    ));
+
+    // TinyLlama has 22 layers with GQA (4 KV heads, head_dim=64)
+    // For first inference without cache, provide empty past_key_values
+    const numLayers = 22;
+    const numKVHeads = 4;
+    const headDim = 64;
+    
+    for (let i = 0; i < numLayers; i++) {
+      // past_key_values.{i}.key: [batch, num_kv_heads, 0, head_dim]
+      inputs.set(`past_key_values.${i}.key`, new EdgeFlowTensor(
+        new Float32Array(0),
+        [1, numKVHeads, 0, headDim],
+        'float32'
+      ));
+      // past_key_values.{i}.value: [batch, num_kv_heads, 0, head_dim]
+      inputs.set(`past_key_values.${i}.value`, new EdgeFlowTensor(
+        new Float32Array(0),
+        [1, numKVHeads, 0, headDim],
+        'float32'
+      ));
+    }
+
+    // Run inference with named inputs
+    const outputs = await runInferenceNamed(this.model, inputs);
     
     if (!outputs || outputs.length === 0) {
       throw new Error('Model returned no outputs');

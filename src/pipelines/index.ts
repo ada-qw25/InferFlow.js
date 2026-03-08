@@ -9,6 +9,8 @@ import {
   QuantizationType,
 } from '../core/types.js';
 
+import { getPluginPipeline } from '../core/plugin.js';
+
 // Base
 export {
   BasePipeline,
@@ -171,6 +173,21 @@ import { ImageSegmentationPipeline } from './image-segmentation.js';
  * });
  * ```
  */
+/**
+ * Experimental tasks that use heuristic/mock inference instead of real models.
+ * These work for demos but are not production-ready without a real model.
+ */
+const EXPERIMENTAL_TASKS = new Set<string>([
+  'text-classification',
+  'sentiment-analysis',
+  'feature-extraction',
+  'image-classification',
+  'object-detection',
+  'automatic-speech-recognition',
+  'zero-shot-classification',
+  'question-answering',
+]);
+
 export async function pipeline<T extends keyof PipelineTaskMap>(
   task: T,
   options?: PipelineFactoryOptions
@@ -182,6 +199,13 @@ export async function pipeline<T extends keyof PipelineTaskMap>(
     cache: options?.cache ?? true,
     quantization: options?.quantization,
   };
+
+  if (EXPERIMENTAL_TASKS.has(task) && !options?.model) {
+    console.warn(
+      `[edgeFlow.js] Pipeline "${task}" is experimental without a real model. ` +
+      `Provide a model via options.model or use the transformers.js adapter for production accuracy.`
+    );
+  }
 
   type AllPipelines = TextClassificationPipeline | SentimentAnalysisPipeline | FeatureExtractionPipeline | ImageClassificationPipeline | TextGenerationPipeline | ObjectDetectionPipeline | AutomaticSpeechRecognitionPipeline | ZeroShotClassificationPipeline | QuestionAnsweringPipeline | ImageSegmentationPipeline;
   
@@ -218,8 +242,18 @@ export async function pipeline<T extends keyof PipelineTaskMap>(
     case 'image-segmentation':
       pipelineInstance = new ImageSegmentationPipeline(config);
       break;
-    default:
-      throw new Error(`Unknown pipeline task: ${task}`);
+    default: {
+      // Check if a plugin provides this pipeline task
+      const pluginEntry = getPluginPipeline(task);
+      if (pluginEntry) {
+        pipelineInstance = pluginEntry.factory(config);
+        break;
+      }
+      throw new Error(
+        `Unknown pipeline task: "${task}". ` +
+        `Register a plugin with registerPlugin() to add custom pipeline tasks.`
+      );
+    }
   }
 
   // Initialize the pipeline

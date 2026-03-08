@@ -1,74 +1,60 @@
 # edgeFlow.js Benchmarks
 
-本目录包含 edgeFlow.js 的性能基准测试。
+This directory contains performance benchmarks for edgeFlow.js.
 
-## 运行基准测试
+## Running Benchmarks
 
 ```bash
-# 安装依赖
 npm install
-
-# 构建项目
 npm run build
-
-# 运行基准测试
-npm run benchmark
+npm run test -- --run tests/unit/
 ```
 
-## 基准测试类型
+> **Note:** A dedicated `npm run benchmark` script with browser-based benchmarks is planned. The unit tests include basic tensor and scheduler performance validation.
 
-### 1. Tensor 操作基准测试
+## Benchmark Types
 
-测试基本张量操作的性能：
-- 张量创建
-- 形状变换 (reshape, transpose)
-- 数据访问
+### 1. Tensor Operations
 
-### 2. 模型加载基准测试
+- Tensor creation and disposal
+- Shape transformation (reshape, transpose)
+- Math operations (add, matmul, softmax)
 
-测试模型加载性能：
-- 缓存 vs 非缓存加载
-- 分片下载 vs 单次下载
-- 预加载性能
+### 2. Scheduler Throughput
 
-### 3. 推理基准测试
+- Priority queue ordering under load
+- Concurrent task execution
+- Task cancellation overhead
 
-测试不同任务的推理性能：
-- 文本分类
-- 特征提取
-- 图像分类
+### 3. Model Loading
 
-### 4. 并发基准测试
+- Cached vs uncached loads (IndexedDB)
+- Chunked download with resume
+- Preloading pipeline
 
-测试并发执行性能：
-- 单模型串行 vs 并行
-- 多模型并发
+### 4. Inference Latency
 
-## 与 transformers.js 对比
+- Text generation (TinyLlama) end-to-end
+- Image segmentation (SlimSAM) encode + decode
 
-| 指标 | edgeFlow.js | transformers.js |
-|------|-------------|-----------------|
-| 包大小 | < 500KB | ~2-5MB |
-| 首次加载 | ~1.5s | ~3s |
-| 推理延迟 | ~40ms | ~45ms |
-| 并发4模型 | ~50ms | ~180ms |
-| 内存占用 | ~50MB | ~80MB |
+## How edgeFlow.js Adds Value
 
-*注：以上数据为参考值，实际性能因环境而异*
+edgeFlow.js is not a replacement for inference engines like ONNX Runtime or transformers.js. It is an **orchestration layer** that adds production features on top of them:
 
-## 测试环境
+| Scenario | Without edgeFlow.js | With edgeFlow.js |
+|----------|---------------------|------------------|
+| 5 concurrent model calls | Uncontrolled, may OOM | Scheduled with concurrency limits |
+| Repeated inference on same input | Recomputed every time | Cached results (LRU/TTL) |
+| Large model download interrupted | Start from scratch | Resume from last chunk |
+| Memory leak from undisposed tensors | Silent leak | Detected and warned |
 
-建议在以下环境运行基准测试：
-- Chrome 113+ (推荐，支持 WebGPU)
-- Node.js 18+
-- 至少 4GB 可用内存
+> All benchmark claims will be backed by reproducible scripts before the 1.0 release.
 
-## 自定义基准测试
+## Custom Benchmarks
 
 ```typescript
 import { runBenchmark, benchmarkSuite } from 'edgeflowjs/tools';
 
-// 单个基准测试
 const result = await runBenchmark(
   async () => {
     await model.run(input);
@@ -83,7 +69,6 @@ const result = await runBenchmark(
 console.log(`Average: ${result.avgTime.toFixed(2)}ms`);
 console.log(`Throughput: ${result.throughput.toFixed(2)} ops/sec`);
 
-// 基准测试套件
 const results = await benchmarkSuite({
   'small-model': async () => smallModel.run(input),
   'large-model': async () => largeModel.run(input),

@@ -83,7 +83,14 @@ export const COCO_LABELS = [
  * }
  * ```
  */
+/**
+ * **Status: Experimental** - Postprocessing (NMS, IoU) is real, but requires
+ * a real ONNX detection model. For production use, pair with the transformers.js
+ * adapter backend or provide a real ONNX model.
+ */
 export class ObjectDetectionPipeline extends BasePipeline<ImageInput | ImageInput[], Detection[]> {
+  static readonly experimental = true;
+
   private preprocessor: ImagePreprocessor;
   private labels: string[];
 

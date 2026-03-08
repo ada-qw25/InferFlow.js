@@ -34,11 +34,17 @@ export interface FeatureExtractionOptions extends PipelineOptions {
 
 /**
  * FeatureExtractionPipeline - Extract embeddings from text
+ * 
+ * **Status: Experimental** - Generates mock embeddings, not from a real model.
+ * For production use, pair with the transformers.js adapter backend or
+ * provide a real ONNX model.
  */
 export class FeatureExtractionPipeline extends BasePipeline<
   string | string[],
   FeatureExtractionResult | FeatureExtractionResult[]
 > {
+  static readonly experimental = true;
+
   private tokenizer: Tokenizer | null = null;
   private embeddingDim: number;
 
@@ -55,6 +61,14 @@ export class FeatureExtractionPipeline extends BasePipeline<
     
     if (!this.tokenizer) {
       this.tokenizer = createBasicTokenizer();
+    }
+
+    if (this.config.model === 'default') {
+      console.warn(
+        '[edgeFlow.js] FeatureExtractionPipeline is running in experimental mode ' +
+        'with mock embeddings. For production accuracy, provide a real ONNX model ' +
+        'or use the transformers.js adapter backend.'
+      );
     }
   }
 

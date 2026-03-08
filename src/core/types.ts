@@ -105,6 +105,8 @@ export interface Runtime {
   loadModel(modelData: ArrayBuffer, options?: ModelLoadOptions): Promise<LoadedModel>;
   /** Run inference */
   run(model: LoadedModel, inputs: Tensor[]): Promise<Tensor[]>;
+  /** Run inference with named inputs (optional) */
+  runNamed?(model: LoadedModel, namedInputs: Map<string, Tensor>): Promise<Tensor[]>;
   /** Dispose the runtime and free resources */
   dispose(): void;
 }
@@ -253,6 +255,16 @@ export interface SchedulerOptions {
   maxBatchSize?: number;
   /** Batch timeout in milliseconds */
   batchTimeout?: number;
+  /** Maximum retry attempts for failed tasks (default: 0 = no retry) */
+  maxRetries?: number;
+  /** Base delay between retries in ms (exponential backoff) */
+  retryBaseDelay?: number;
+  /** Enable circuit breaker per model (default: false) */
+  circuitBreaker?: boolean;
+  /** Consecutive failures before the circuit opens (default: 5) */
+  circuitBreakerThreshold?: number;
+  /** Time in ms before the circuit half-opens to test (default: 30000) */
+  circuitBreakerResetTimeout?: number;
 }
 
 // ============================================================================

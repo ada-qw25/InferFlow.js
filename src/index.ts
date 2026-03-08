@@ -138,6 +138,39 @@ export {
   gc,
 } from './core/memory.js';
 
+// Plugin system
+export {
+  registerPlugin,
+  getPluginPipeline,
+  getPluginMiddleware,
+  listPlugins,
+  unregisterPlugin,
+  type EdgeFlowPlugin,
+  type PluginPipelineEntry,
+  type PluginBackendEntry,
+  type PluginMiddleware,
+} from './core/plugin.js';
+
+// Device profiling
+export {
+  getDeviceProfile,
+  recommendQuantization,
+  recommendModelVariant,
+  resetDeviceProfile,
+  type DeviceProfile,
+  type DeviceTier,
+  type ModelRecommendation,
+} from './core/device-profiler.js';
+
+// Pipeline composition
+export {
+  compose,
+  parallel,
+  type CompositionStage,
+  type CompositionResult,
+  type ComposedPipeline,
+} from './core/composer.js';
+
 // Runtime management
 export {
   RuntimeManager,
@@ -164,6 +197,13 @@ export {
   WASMRuntime,
   createWASMRuntime,
   registerAllBackends,
+  
+  // transformers.js adapter
+  TransformersAdapterRuntime,
+  useTransformersBackend,
+  getTransformersAdapter,
+  type TransformersAdapterOptions,
+  type TransformersPipelineFactory,
 } from './backends/index.js';
 
 // ============================================================================

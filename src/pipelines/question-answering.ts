@@ -70,10 +70,17 @@ export interface QuestionAnsweringResult extends PipelineResult {
  * console.log(result.answer); // 'Paris'
  * ```
  */
+/**
+ * **Status: Experimental** - Uses word-overlap heuristic, not a real QA model.
+ * For production use, pair with the transformers.js adapter backend or
+ * provide a real ONNX QA model.
+ */
 export class QuestionAnsweringPipeline extends BasePipeline<
   QAInput | QAInput[],
   QuestionAnsweringResult | QuestionAnsweringResult[]
 > {
+  static readonly experimental = true;
+
   private tokenizer: Tokenizer | null = null;
 
   constructor(config?: PipelineConfig) {

@@ -77,6 +77,8 @@ export interface Runtime {
     loadModel(modelData: ArrayBuffer, options?: ModelLoadOptions): Promise<LoadedModel>;
     /** Run inference */
     run(model: LoadedModel, inputs: Tensor[]): Promise<Tensor[]>;
+    /** Run inference with named inputs (optional) */
+    runNamed?(model: LoadedModel, namedInputs: Map<string, Tensor>): Promise<Tensor[]>;
     /** Dispose the runtime and free resources */
     dispose(): void;
 }

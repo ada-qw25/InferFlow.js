@@ -90,12 +90,25 @@ export function serializeTensor(tensor: Tensor): SerializedTensor {
 }
 
 /**
- * Deserialize a tensor from worker
+ * Deserialize a tensor from worker.
+ * Uses a lazy import to avoid circular dependency issues.
  */
-export function deserializeTensor(serialized: SerializedTensor): Tensor {
-  const { EdgeFlowTensor } = require('./tensor.js');
+export async function deserializeTensor(serialized: SerializedTensor): Promise<Tensor> {
+  const { EdgeFlowTensor } = await import('./tensor.js');
   const data = new Float32Array(serialized.data);
   return new EdgeFlowTensor(data, serialized.shape, serialized.dtype as 'float32');
+}
+
+/**
+ * Synchronous deserialisation used internally where async is not feasible.
+ * Requires EdgeFlowTensor to be passed in to avoid require().
+ */
+export function deserializeTensorSync(
+  serialized: SerializedTensor,
+  TensorClass: new (data: Float32Array, shape: number[], dtype: string) => Tensor,
+): Tensor {
+  const data = new Float32Array(serialized.data);
+  return new TensorClass(data, serialized.shape, serialized.dtype);
 }
 
 // ============================================================================
@@ -335,7 +348,7 @@ export class InferenceWorker {
       'run_inference',
       { modelId, inputs: serializedInputs }
     );
-    return result.outputs.map(deserializeTensor);
+    return Promise.all(result.outputs.map(deserializeTensor));
   }
 
   /**

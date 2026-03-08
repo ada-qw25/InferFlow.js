@@ -6,7 +6,7 @@
  */
 import { EdgeFlowTensor } from '../core/tensor.js';
 import { BasePipeline, registerPipeline } from './base.js';
-import { loadModel, loadModelFromBuffer, runInference } from '../core/runtime.js';
+import { loadModel, loadModelFromBuffer, runInference, runInferenceNamed } from '../core/runtime.js';
 // ============================================================================
 // Default Model URLs (SlimSAM - quantized for browser)
 // ============================================================================
@@ -42,6 +42,7 @@ export class ImageSegmentationPipeline extends BasePipeline {
     encoderModel = null;
     decoderModel = null;
     imageEmbedding = null;
+    imagePositionalEmbedding = null;
     currentImageSize = null;
     resizedImageSize = null;
     inputSize = 1024; // SAM default input size
@@ -84,7 +85,7 @@ export class ImageSegmentationPipeline extends BasePipeline {
             });
         });
         this.encoderModel = await loadModelFromBuffer(encoderData, {
-            runtime: 'wasm',
+            runtime: 'wasm', // Uses ONNXRuntime which auto-detects WebGPU internally
         });
         // Load decoder
         onProgress?.({ model: 'decoder', loaded: 0, total: 100, progress: 0 });
@@ -97,7 +98,7 @@ export class ImageSegmentationPipeline extends BasePipeline {
             });
         });
         this.decoderModel = await loadModelFromBuffer(decoderData, {
-            runtime: 'wasm',
+            runtime: 'wasm', // Uses ONNXRuntime which auto-detects WebGPU internally
         });
         this.modelsLoaded = true;
     }
@@ -181,7 +182,14 @@ export class ImageSegmentationPipeline extends BasePipeline {
         // Run encoder
         if (this.encoderModel) {
             const outputs = await runInference(this.encoderModel, [inputTensor]);
+            // SlimSAM encoder outputs: [image_embeddings, image_positional_embeddings]
             this.imageEmbedding = outputs[0];
+            this.imagePositionalEmbedding = outputs[1];
+            console.log('[SAM] Encoder outputs:', outputs.length);
+            console.log('[SAM] image_embeddings shape:', this.imageEmbedding.shape);
+            if (this.imagePositionalEmbedding) {
+                console.log('[SAM] image_positional_embeddings shape:', this.imagePositionalEmbedding.shape);
+            }
         }
         else {
             throw new Error('Encoder model not loaded');
@@ -201,11 +209,17 @@ export class ImageSegmentationPipeline extends BasePipeline {
         const { points = [], boxes = [], maskThreshold = 0.0, returnAllMasks = false } = options;
         // Prepare inputs for decoder
         const decoderInputs = this.prepareDecoderInputs(points, boxes);
-        // Run decoder model
-        const outputs = await runInference(this.decoderModel, [
-            this.imageEmbedding,
-            ...decoderInputs,
-        ]);
+        // Add image embeddings to inputs
+        decoderInputs.set('image_embeddings', this.imageEmbedding);
+        // Add positional embeddings (required by SlimSAM)
+        if (this.imagePositionalEmbedding) {
+            decoderInputs.set('image_positional_embeddings', this.imagePositionalEmbedding);
+        }
+        else {
+            throw new Error('image_positional_embeddings not available from encoder');
+        }
+        // Run decoder model with named inputs
+        const outputs = await runInferenceNamed(this.decoderModel, decoderInputs);
         // SAM decoder outputs: [masks, iou_predictions]
         const masks = outputs[0];
         const scores = outputs[1];
@@ -336,11 +350,19 @@ export class ImageSegmentationPipeline extends BasePipeline {
         };
     }
     /**
-     * Prepare decoder inputs (prompts)
+     * Prepare decoder inputs (prompts) for SlimSAM
+     *
+     * SlimSAM prompt_encoder_mask_decoder expects these named inputs:
+     * - image_embeddings: [1, 256, 64, 64]
+     * - point_coords: [batch, num_points, 2]
+     * - point_labels: [batch, num_points]
+     * - mask_input: [batch, 1, 256, 256]
+     * - has_mask_input: [batch, 1]
+     * - orig_im_size: [2]
+     * - position_ids: [batch, num_points]
      */
     prepareDecoderInputs(points, boxes) {
         const { width: resizedW, height: resizedH } = this.resizedImageSize;
-        const { width: origW, height: origH } = this.currentImageSize;
         // Scale factors for converting normalized coords to resized image coords
         const scaleX = resizedW;
         const scaleY = resizedH;
@@ -366,13 +388,14 @@ export class ImageSegmentationPipeline extends BasePipeline {
             allLabels.push(1);
         }
         const numPoints = allLabels.length;
-        // input_points: [1, 1, num_points, 2]
-        const pointCoords = new EdgeFlowTensor(new Float32Array(allPoints), [1, 1, numPoints, 2], 'float32');
-        // input_labels: [1, 1, num_points]
-        const pointLabels = new EdgeFlowTensor(BigInt64Array.from(allLabels.map(l => BigInt(l))), [1, 1, numPoints], 'int64');
-        // orig_im_size: original image size for mask upscaling
-        const origImSize = new EdgeFlowTensor(BigInt64Array.from([BigInt(origH), BigInt(origW)]), [2], 'int64');
-        return [pointCoords, pointLabels, origImSize];
+        const inputs = new Map();
+        // input_points: [1, 1, num_points, 2] - SlimSAM format (float32)
+        inputs.set('input_points', new EdgeFlowTensor(new Float32Array(allPoints), [1, 1, numPoints, 2], 'float32'));
+        // input_labels: [1, 1, num_points] - SlimSAM format (int64)
+        inputs.set('input_labels', new EdgeFlowTensor(BigInt64Array.from(allLabels.map(l => BigInt(l))), [1, 1, numPoints], 'int64'));
+        // Note: image_embeddings and image_positional_embeddings are added in segment()
+        // SlimSAM decoder only needs: image_embeddings, image_positional_embeddings, input_points, input_labels
+        return inputs;
     }
     /**
      * Post-process masks from decoder output
@@ -454,6 +477,7 @@ export class ImageSegmentationPipeline extends BasePipeline {
      */
     clearImage() {
         this.imageEmbedding = null;
+        this.imagePositionalEmbedding = null;
         this.currentImageSize = null;
         this.resizedImageSize = null;
     }
@@ -485,6 +509,7 @@ export class ImageSegmentationPipeline extends BasePipeline {
         this.encoderModel?.dispose();
         this.decoderModel?.dispose();
         this.imageEmbedding = null;
+        this.imagePositionalEmbedding = null;
         this.currentImageSize = null;
         this.resizedImageSize = null;
         this.modelsLoaded = false;

@@ -75,9 +75,6 @@ export class ONNXRuntime implements Runtime {
       ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/';
     }
 
-    // Use WASM execution provider (most compatible)
-    this.executionProvider = 'wasm';
-
     this.initialized = true;
   }
 
@@ -93,15 +90,30 @@ export class ONNXRuntime implements Runtime {
     }
 
     try {
-      // Create session options
-      const sessionOptions = {
-        executionProviders: [this.executionProvider],
-        graphOptimizationLevel: 'all' as const,
+      // Create session options with multiple execution providers
+      // ONNX Runtime will try them in order and use the first available one
+      const sessionOptions: ort.InferenceSession.SessionOptions = {
+        executionProviders: ['webgpu', 'wasm'], // Try WebGPU first, fallback to WASM
+        graphOptimizationLevel: 'all',
       };
 
       // Create inference session (convert ArrayBuffer to Uint8Array)
       const modelBytes = new Uint8Array(modelData);
-      const session = await ort.InferenceSession.create(modelBytes, sessionOptions);
+      
+      let session: ort.InferenceSession;
+      try {
+        session = await ort.InferenceSession.create(modelBytes, sessionOptions);
+        console.log('[ONNX] Session created (tried WebGPU → WASM)');
+      } catch (e) {
+        // If WebGPU fails, try WASM only
+        console.log('[ONNX] WebGPU not available, falling back to WASM. Reason:', e instanceof Error ? e.message : e);
+        const wasmOptions: ort.InferenceSession.SessionOptions = {
+          executionProviders: ['wasm'],
+          graphOptimizationLevel: 'all',
+        };
+        session = await ort.InferenceSession.create(modelBytes, wasmOptions);
+        console.log('[ONNX] Session created with WASM backend');
+      }
       
       // Get input/output names
       const inputNames = session.inputNames;
@@ -220,6 +232,77 @@ export class ONNXRuntime implements Runtime {
 
       return outputs;
     } catch (error) {
+      throw new EdgeFlowError(
+        `ONNX inference failed: ${error instanceof Error ? error.message : String(error)}`,
+        ErrorCodes.INFERENCE_FAILED,
+        { modelId: model.id, error }
+      );
+    }
+  }
+
+  /**
+   * Run inference with named inputs
+   */
+  async runNamed(model: LoadedModel, namedInputs: Map<string, Tensor>): Promise<Tensor[]> {
+    const sessionData = sessionStore.get(model.id);
+    if (!sessionData) {
+      throw new EdgeFlowError(
+        `ONNX session not found for model ${model.id}`,
+        ErrorCodes.MODEL_NOT_LOADED,
+        { modelId: model.id }
+      );
+    }
+
+    const { session, inputNames, outputNames } = sessionData;
+
+    try {
+      // Prepare input feeds from named inputs
+      const feeds: Record<string, any> = {};
+      
+      // Log expected vs provided inputs for debugging
+      console.log('[ONNX] Model expects inputs:', inputNames);
+      console.log('[ONNX] Provided inputs:', Array.from(namedInputs.keys()));
+      
+      for (const [inputName, inputTensor] of namedInputs) {
+        const tensor = inputTensor as EdgeFlowTensor;
+        const dtype = tensor.dtype;
+        let ortTensor: any;
+        
+        if (dtype === 'int64') {
+          const data = tensor.data as unknown as BigInt64Array;
+          ortTensor = new ort.Tensor('int64', data, tensor.shape as number[]);
+        } else if (dtype === 'int32') {
+          const data = tensor.data as Int32Array;
+          ortTensor = new ort.Tensor('int32', data, tensor.shape as number[]);
+        } else {
+          const data = tensor.toFloat32Array();
+          ortTensor = new ort.Tensor('float32', data, tensor.shape as number[]);
+        }
+        
+        feeds[inputName] = ortTensor;
+        console.log(`[ONNX] Input '${inputName}': shape=${tensor.shape}, dtype=${dtype}`);
+      }
+
+      // Run inference
+      const results = await session.run(feeds);
+
+      // Convert outputs to EdgeFlowTensor
+      const outputs: Tensor[] = [];
+      
+      for (const outputName of outputNames) {
+        const ortTensor = results[outputName];
+        if (ortTensor) {
+          const data = ortTensor.data as Float32Array;
+          const shape = Array.from(ortTensor.dims).map(d => Number(d));
+          outputs.push(new EdgeFlowTensor(new Float32Array(data), shape, 'float32'));
+        }
+      }
+
+      return outputs;
+    } catch (error) {
+      // Log detailed error info
+      console.error('[ONNX] Inference failed. Model expects:', inputNames);
+      console.error('[ONNX] Provided:', Array.from(namedInputs.keys()));
       throw new EdgeFlowError(
         `ONNX inference failed: ${error instanceof Error ? error.message : String(error)}`,
         ErrorCodes.INFERENCE_FAILED,

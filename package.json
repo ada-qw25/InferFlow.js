@@ -46,6 +46,9 @@
     "test:coverage": "vitest run --coverage",
     "demo": "npm run build && node demo/server.js",
     "demo:server": "node demo/server.js",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs",
     "prepublishOnly": "npm run clean && npm run build && npm run test"
   },
   "keywords": [

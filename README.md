@@ -21,7 +21,7 @@
 - 💾 **Memory Management** - Automatic memory tracking and cleanup with scopes
 - 📥 **Smart Model Loading** - Preloading, sharding, resume download support
 - 💿 **Offline Caching** - IndexedDB-based model caching for offline use
-- ⚡ **Multi-Backend** - WebGPU, WebNN, WASM with automatic fallback
+- ⚡ **Multi-Backend** - ONNX Runtime with WebGPU/WASM execution providers, automatic fallback
 - 🤗 **HuggingFace Hub** - Direct model download with one line
 - 🔤 **Real Tokenizers** - BPE & WordPiece tokenizers, load tokenizer.json directly
 - 👷 **Web Worker Support** - Run inference in background threads
@@ -231,30 +231,62 @@ pool.terminate();
 
 | Task | Pipeline | Status |
 |------|----------|--------|
-| Text Classification | `text-classification` | ✅ |
-| Sentiment Analysis | `sentiment-analysis` | ✅ |
-| Feature Extraction | `feature-extraction` | ✅ |
-| Image Classification | `image-classification` | ✅ |
-| Text Generation | `text-generation` | ✅ |
-| Object Detection | `object-detection` | ✅ |
-| Speech Recognition | `automatic-speech-recognition` | ✅ |
-| Zero-shot Classification | `zero-shot-classification` | ✅ |
-| Question Answering | `question-answering` | ✅ |
+| Text Generation | `text-generation` | ✅ Production (TinyLlama, streaming, KV cache) |
+| Image Segmentation | `image-segmentation` | ✅ Production (SlimSAM, interactive prompts) |
+| Text Classification | `text-classification` | ⚠️ Experimental (heuristic, provide own model) |
+| Sentiment Analysis | `sentiment-analysis` | ⚠️ Experimental (heuristic, provide own model) |
+| Feature Extraction | `feature-extraction` | ⚠️ Experimental (mock embeddings, provide own model) |
+| Image Classification | `image-classification` | ⚠️ Experimental (heuristic, provide own model) |
+| Object Detection | `object-detection` | ⚠️ Experimental (real NMS/IoU, needs own model) |
+| Speech Recognition | `automatic-speech-recognition` | ⚠️ Experimental (preprocessing only, needs model) |
+| Zero-shot Classification | `zero-shot-classification` | ⚠️ Experimental (random scoring, needs NLI model) |
+| Question Answering | `question-answering` | ⚠️ Experimental (word overlap heuristic, needs model) |
+
+> **Note:** Experimental pipelines work for demos and testing the API surface. For production accuracy, provide a real ONNX model via `options.model` or use the **transformers.js adapter backend** to leverage HuggingFace's model ecosystem.
 
 ## ⚡ Key Differentiators
 
-### Comparison with transformers.js
+edgeFlow.js is not a replacement for transformers.js — it is a **production orchestration layer** that can wrap any inference engine (including transformers.js) and add the features real apps need.
 
-| Feature | transformers.js | edgeFlow.js |
-|---------|-----------------|-------------|
-| Task Scheduler | ❌ None | ✅ Priority queue with limits |
-| Task Cancellation | ❌ None | ✅ Cancel pending tasks |
-| Batch Processing | ⚠️ Manual | ✅ Built-in batching |
-| Memory Scopes | ❌ None | ✅ Auto cleanup with scopes |
-| Model Preloading | ❌ None | ✅ Background loading |
-| Resume Download | ❌ None | ✅ Chunked with resume |
-| Model Caching | ⚠️ Basic | ✅ IndexedDB with stats |
-| TypeScript | ✅ Full | ✅ Full |
+### What edgeFlow.js adds on top of inference engines
+
+| Feature | Inference engines alone | With edgeFlow.js |
+|---------|------------------------|------------------|
+| Task Scheduling | None — run and hope | Priority queue with concurrency limits |
+| Task Cancellation | Not possible | Cancel pending/queued tasks |
+| Batch Processing | Manual | Built-in batching with configurable size |
+| Memory Management | Manual cleanup | Automatic scopes, leak detection, GC hints |
+| Model Preloading | Manual | Background preloading with priority queue |
+| Resume Download | Start over on failure | Chunked download with automatic resume |
+| Model Caching | Basic or none | IndexedDB cache with stats and eviction |
+| Pipeline Composition | Not available | Chain multiple models (ASR → translate → TTS) |
+| Device Adaptation | Manual model selection | Auto-select model variant by device capability |
+| Performance Monitoring | External tooling needed | Built-in dashboard and alerting |
+
+## 🔌 transformers.js Adapter (Recommended)
+
+Use edgeFlow.js as an orchestration layer on top of [transformers.js](https://huggingface.co/docs/transformers.js) to get access to 1000+ HuggingFace models with scheduling, caching, and memory management:
+
+```typescript
+import { pipeline as tfPipeline } from '@xenova/transformers';
+import { useTransformersBackend, pipeline } from 'edgeflowjs';
+
+// Register transformers.js as the inference backend
+useTransformersBackend({
+  pipelineFactory: tfPipeline,
+  device: 'webgpu',    // GPU acceleration
+  dtype: 'fp16',       // Half precision
+});
+
+// Use edgeFlow.js API — scheduling, caching, memory management included
+const classifier = await pipeline('text-classification', {
+  model: 'Xenova/distilbert-base-uncased-finetuned-sst-2-english',
+});
+
+const result = await classifier.run('I love this product!');
+```
+
+> **Why?** transformers.js is excellent at loading and running single models. edgeFlow.js adds the production features you need when running multiple models, managing memory on constrained devices, caching for offline use, and scheduling concurrent inference.
 
 ## 🔧 Configuration
 

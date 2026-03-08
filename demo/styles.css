@@ -778,7 +778,8 @@ footer a:hover {
 .chat-container {
   display: flex;
   flex-direction: column;
-  height: 280px;
+  height: 400px;
+  min-height: 300px;
   background: var(--color-dark);
   border-radius: var(--radius-md);
   overflow: hidden;

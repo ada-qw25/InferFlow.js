@@ -315,6 +315,15 @@ function generateTaskId(): string {
 }
 
 /**
+ * Circuit breaker state per model
+ */
+interface CircuitState {
+  failures: number;
+  state: 'closed' | 'open' | 'half-open';
+  lastFailure: number;
+}
+
+/**
  * Default scheduler options
  */
 const DEFAULT_OPTIONS: Required<SchedulerOptions> = {
@@ -324,6 +333,11 @@ const DEFAULT_OPTIONS: Required<SchedulerOptions> = {
   enableBatching: false,
   maxBatchSize: 32,
   batchTimeout: 50,
+  maxRetries: 0,
+  retryBaseDelay: 1000,
+  circuitBreaker: false,
+  circuitBreakerThreshold: 5,
+  circuitBreakerResetTimeout: 30000,
 };
 
 /**
@@ -343,12 +357,69 @@ export class InferenceScheduler {
   private readonly allTasks: Map<string, Task> = new Map();
   private readonly batchers: Map<string, BatchCollector<unknown>> = new Map();
   private readonly listeners: Map<EventType, Set<EventListener>> = new Map();
+  private readonly circuits: Map<string, CircuitState> = new Map();
   private globalRunningCount = 0;
   private isProcessing = false;
   private disposed = false;
 
   constructor(options: SchedulerOptions = {}) {
     this.options = { ...DEFAULT_OPTIONS, ...options };
+  }
+
+  /**
+   * Get circuit breaker state for a model, creating default if absent
+   */
+  private getCircuit(modelId: string): CircuitState {
+    let c = this.circuits.get(modelId);
+    if (!c) {
+      c = { failures: 0, state: 'closed', lastFailure: 0 };
+      this.circuits.set(modelId, c);
+    }
+    return c;
+  }
+
+  /**
+   * Check if the circuit for a model allows new tasks
+   */
+  private isCircuitOpen(modelId: string): boolean {
+    if (!this.options.circuitBreaker) return false;
+    const c = this.getCircuit(modelId);
+    if (c.state === 'closed') return false;
+    if (c.state === 'open') {
+      if (Date.now() - c.lastFailure > this.options.circuitBreakerResetTimeout) {
+        c.state = 'half-open';
+        return false; // allow one probe
+      }
+      return true;
+    }
+    return false; // half-open allows one
+  }
+
+  /**
+   * Record a success for circuit breaker
+   */
+  private circuitSuccess(modelId: string): void {
+    if (!this.options.circuitBreaker) return;
+    const c = this.getCircuit(modelId);
+    c.failures = 0;
+    c.state = 'closed';
+  }
+
+  /**
+   * Record a failure for circuit breaker
+   */
+  private circuitFailure(modelId: string): void {
+    if (!this.options.circuitBreaker) return;
+    const c = this.getCircuit(modelId);
+    c.failures++;
+    c.lastFailure = Date.now();
+    if (c.failures >= this.options.circuitBreakerThreshold) {
+      c.state = 'open';
+      this.emit('inference:error', {
+        modelId,
+        error: new Error(`Circuit breaker opened after ${c.failures} consecutive failures`),
+      });
+    }
   }
 
   /**
@@ -480,20 +551,60 @@ export class InferenceScheduler {
       );
     }
 
+    if (this.isCircuitOpen(modelId)) {
+      throw new EdgeFlowError(
+        `Circuit breaker is open for model ${modelId} — too many consecutive failures. ` +
+        `Retry after ${this.options.circuitBreakerResetTimeout}ms.`,
+        ErrorCodes.INFERENCE_FAILED,
+        { modelId },
+      );
+    }
+
+    // Wrap executor with retry logic
+    const maxRetries = this.options.maxRetries;
+    const baseDelay = this.options.retryBaseDelay;
+    const wrappedExecutor = maxRetries > 0
+      ? async (): Promise<T> => {
+          let lastError: Error | undefined;
+          for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+              const result = await executor();
+              this.circuitSuccess(modelId);
+              return result;
+            } catch (err) {
+              lastError = err instanceof Error ? err : new Error(String(err));
+              this.circuitFailure(modelId);
+              if (attempt < maxRetries) {
+                const delay = baseDelay * Math.pow(2, attempt);
+                await new Promise(r => setTimeout(r, delay));
+              }
+            }
+          }
+          throw lastError!;
+        }
+      : async (): Promise<T> => {
+          try {
+            const result = await executor();
+            this.circuitSuccess(modelId);
+            return result;
+          } catch (err) {
+            this.circuitFailure(modelId);
+            throw err;
+          }
+        };
+
     const task = new Task<T>(
       generateTaskId(),
       modelId,
       priority,
-      executor
+      wrappedExecutor
     );
 
     this.allTasks.set(task.id, task as Task);
 
-    // Add to queue
     const queue = this.getQueue(modelId);
     queue.enqueue(task as Task);
 
-    // Trigger processing
     this.processQueue();
 
     return task;

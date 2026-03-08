@@ -29,6 +29,10 @@ export declare class ONNXRuntime implements Runtime {
      */
     run(model: LoadedModel, inputs: Tensor[]): Promise<Tensor[]>;
     /**
+     * Run inference with named inputs
+     */
+    runNamed(model: LoadedModel, namedInputs: Map<string, Tensor>): Promise<Tensor[]>;
+    /**
      * Unload a model
      */
     private unloadModel;

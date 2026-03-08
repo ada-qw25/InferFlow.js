@@ -107,6 +107,10 @@ export declare function loadModelFromBuffer(data: ArrayBuffer, options?: ModelLo
  */
 export declare function runInference(model: LoadedModel, inputs: Tensor[]): Promise<Tensor[]>;
 /**
+ * Run inference with named inputs
+ */
+export declare function runInferenceNamed(model: LoadedModel, namedInputs: Map<string, Tensor>): Promise<Tensor[]>;
+/**
  * Run inference with batch processing
  */
 export declare function runBatchInference(model: LoadedModel, batches: Tensor[][]): Promise<Tensor[][]>;

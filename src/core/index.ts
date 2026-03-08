@@ -67,6 +67,39 @@ export {
   getAvailableRuntimes,
 } from './runtime.js';
 
+// Plugin System
+export {
+  registerPlugin,
+  getPluginPipeline,
+  getPluginMiddleware,
+  listPlugins,
+  unregisterPlugin,
+  type EdgeFlowPlugin,
+  type PluginPipelineEntry,
+  type PluginBackendEntry,
+  type PluginMiddleware,
+} from './plugin.js';
+
+// Device Profiler
+export {
+  getDeviceProfile,
+  recommendQuantization,
+  recommendModelVariant,
+  resetDeviceProfile,
+  type DeviceProfile,
+  type DeviceTier,
+  type ModelRecommendation,
+} from './device-profiler.js';
+
+// Composer
+export {
+  compose,
+  parallel,
+  type CompositionStage,
+  type CompositionResult,
+  type ComposedPipeline,
+} from './composer.js';
+
 // Worker
 export {
   InferenceWorker,
