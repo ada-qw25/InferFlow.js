@@ -77,11 +77,26 @@ export class Tokenizer {
         // Load model config
         if (data.model) {
             tokenizer.modelType = data.model.type;
-            // Load vocabulary
+            // Load vocabulary.
+            // BPE/WordPiece: vocab is an object { token: id }.
+            // Unigram (SentencePiece): vocab is an array of [token, score] pairs
+            // where the array *index* is the token ID.
             if (data.model.vocab) {
-                for (const [token, id] of Object.entries(data.model.vocab)) {
-                    tokenizer.vocab.set(token, id);
-                    tokenizer.reverseVocab.set(id, token);
+                if (Array.isArray(data.model.vocab)) {
+                    // Unigram format
+                    const unigramVocab = data.model.vocab;
+                    for (let i = 0; i < unigramVocab.length; i++) {
+                        const entry = unigramVocab[i];
+                        const token = Array.isArray(entry) ? entry[0] : entry;
+                        tokenizer.vocab.set(token, i);
+                        tokenizer.reverseVocab.set(i, token);
+                    }
+                }
+                else {
+                    for (const [token, id] of Object.entries(data.model.vocab)) {
+                        tokenizer.vocab.set(token, id);
+                        tokenizer.reverseVocab.set(id, token);
+                    }
                 }
             }
             // Load merges for BPE
@@ -309,9 +324,45 @@ export class Tokenizer {
             }
             case 'WordPiece':
                 return this.wordPiece(word);
+            case 'Unigram':
+                return this.unigramTokenize(word);
             default:
                 return this.vocab.has(word) ? [word] : [this.unkToken];
         }
+    }
+    /**
+     * Greedy longest-match tokenizer for SentencePiece Unigram models.
+     * Adds the U+2581 (▁) word-start prefix expected by SPM-based models.
+     */
+    unigramTokenize(word) {
+        // SentencePiece prepends ▁ to words that follow a space (i.e. the
+        // tokenizer receives individual words, so all of them get the prefix).
+        const prefixedWord = '\u2581' + word;
+        const tokens = [];
+        let start = 0;
+        const text = prefixedWord;
+        while (start < text.length) {
+            let end = text.length;
+            let found = false;
+            // Greedy longest-match scan
+            while (end > start) {
+                const sub = text.slice(start, end);
+                if (this.vocab.has(sub)) {
+                    tokens.push(sub);
+                    start = end;
+                    found = true;
+                    break;
+                }
+                end--;
+            }
+            if (!found) {
+                // Emit the single character (or unk if it's not in vocab either)
+                const ch = text[start];
+                tokens.push(this.vocab.has(ch) ? ch : this.unkToken);
+                start++;
+            }
+        }
+        return tokens.length > 0 ? tokens : [this.unkToken];
     }
     /**
      * Main tokenization

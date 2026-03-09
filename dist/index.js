@@ -41,12 +41,20 @@ export { EdgeFlowTensor, tensor, zeros, ones, full, random, randn, arange, linsp
 export { InferenceScheduler, getScheduler, setScheduler, configureScheduler, } from './core/scheduler.js';
 // Memory management
 export { MemoryManager, MemoryScope, ModelCache, withMemoryScope, withMemoryScopeSync, getMemoryManager, getMemoryStats, release, gc, } from './core/memory.js';
+// Plugin system
+export { registerPlugin, getPluginPipeline, getPluginMiddleware, listPlugins, unregisterPlugin, } from './core/plugin.js';
+// Device profiling
+export { getDeviceProfile, recommendQuantization, recommendModelVariant, resetDeviceProfile, } from './core/device-profiler.js';
+// Pipeline composition
+export { compose, parallel, } from './core/composer.js';
 // Runtime management
 export { RuntimeManager, LoadedModelImpl, loadModel, loadModelFromBuffer, runInference, runBatchInference, getRuntimeManager, registerRuntime, getBestRuntime, getAvailableRuntimes, } from './core/runtime.js';
 // ============================================================================
 // Backend Exports
 // ============================================================================
-export { WebGPURuntime, createWebGPURuntime, WebNNRuntime, createWebNNRuntime, WASMRuntime, createWASMRuntime, registerAllBackends, } from './backends/index.js';
+export { WebGPURuntime, createWebGPURuntime, WebNNRuntime, createWebNNRuntime, WASMRuntime, createWASMRuntime, registerAllBackends, 
+// transformers.js adapter
+TransformersAdapterRuntime, useTransformersBackend, getTransformersAdapter, } from './backends/index.js';
 // ============================================================================
 // Pipeline Exports
 // ============================================================================

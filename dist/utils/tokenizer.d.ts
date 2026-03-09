@@ -178,6 +178,11 @@ export declare class Tokenizer {
      */
     private tokenizeWord;
     /**
+     * Greedy longest-match tokenizer for SentencePiece Unigram models.
+     * Adds the U+2581 (▁) word-start prefix expected by SPM-based models.
+     */
+    private unigramTokenize;
+    /**
      * Main tokenization
      */
     private tokenize;

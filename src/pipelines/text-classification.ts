@@ -8,9 +8,12 @@
 import {
   PipelineConfig,
   PipelineOptions,
+  LoadedModel,
 } from '../core/types.js';
 import { EdgeFlowTensor, softmax } from '../core/tensor.js';
-import { Tokenizer, createBasicTokenizer } from '../utils/tokenizer.js';
+import { Tokenizer } from '../utils/tokenizer.js';
+import { loadModelData } from '../utils/model-loader.js';
+import { loadModelFromBuffer, runInferenceNamed } from '../core/runtime.js';
 import {
   BasePipeline,
   TextClassificationResult,
@@ -19,71 +22,60 @@ import {
 } from './base.js';
 
 // ============================================================================
+// Default Model (DistilBERT fine-tuned on SST-2)
+// ============================================================================
+
+const DEFAULT_MODELS = {
+  model: 'https://huggingface.co/Xenova/distilbert-base-uncased-finetuned-sst-2-english/resolve/main/onnx/model_quantized.onnx',
+  tokenizer: 'https://huggingface.co/Xenova/distilbert-base-uncased-finetuned-sst-2-english/resolve/main/tokenizer.json',
+};
+
+const DEFAULT_SST2_LABELS = ['NEGATIVE', 'POSITIVE'];
+
+// ============================================================================
 // Text Classification Pipeline
 // ============================================================================
 
-/**
- * Text classification options
- */
 export interface TextClassificationOptions extends PipelineOptions {
-  /** Return all labels with scores */
   returnAllScores?: boolean;
-  /** Custom labels */
   labels?: string[];
-  /** Number of labels to return */
   topK?: number;
 }
 
-/**
- * TextClassificationPipeline - Classify text into categories
- * 
- * **Status: Experimental** - Uses heuristic-based inference, not a real model.
- * Results are approximate. For production use, pair with the transformers.js
- * adapter backend or wait for full ONNX model support.
- */
 export class TextClassificationPipeline extends BasePipeline<
   string | string[],
   TextClassificationResult | TextClassificationResult[]
 > {
-  static readonly experimental = true;
-
   private tokenizer: Tokenizer | null = null;
+  private onnxModel: LoadedModel | null = null;
   private labels: string[];
+  private modelUrl: string;
+  private tokenizerUrl: string;
 
   constructor(config: PipelineConfig, labels?: string[]) {
     super(config);
-    this.labels = labels ?? SENTIMENT_LABELS;
+    this.labels = labels ?? DEFAULT_SST2_LABELS;
+    this.modelUrl = config.model !== 'default' ? config.model : DEFAULT_MODELS.model;
+    this.tokenizerUrl = DEFAULT_MODELS.tokenizer;
   }
 
-  /**
-   * Initialize pipeline
-   */
   override async initialize(): Promise<void> {
     await super.initialize();
-    
+
     if (!this.tokenizer) {
-      this.tokenizer = createBasicTokenizer();
+      this.tokenizer = await Tokenizer.fromUrl(this.tokenizerUrl);
     }
 
-    if (this.config.model === 'default') {
-      console.warn(
-        '[edgeFlow.js] TextClassificationPipeline is running in experimental mode ' +
-        'with heuristic-based inference. For production accuracy, provide a real ' +
-        'ONNX model or use the transformers.js adapter backend.'
-      );
+    if (!this.onnxModel) {
+      const modelData = await loadModelData(this.modelUrl, { cache: this.config.cache ?? true });
+      this.onnxModel = await loadModelFromBuffer(modelData);
     }
   }
 
-  /**
-   * Set custom labels
-   */
   setLabels(labels: string[]): void {
     this.labels = labels;
   }
 
-  /**
-   * Run classification
-   */
   override async run(
     input: string | string[],
     options?: TextClassificationOptions
@@ -97,20 +89,13 @@ export class TextClassificationPipeline extends BasePipeline<
     const results: TextClassificationResult[] = [];
 
     for (const text of inputs) {
-      // Preprocess
       const tensorInputs = await this.preprocess(text);
-      
-      // Run inference
       const outputs = await this.runInference(tensorInputs);
-      
-      // Postprocess
       const result = await this.postprocess(outputs, options);
       results.push(result);
     }
 
     const processingTime = performance.now() - startTime;
-    
-    // Add processing time to results
     for (const result of results) {
       result.processingTime = processingTime / results.length;
     }
@@ -118,59 +103,39 @@ export class TextClassificationPipeline extends BasePipeline<
     return isBatch ? results : results[0]!;
   }
 
-  /**
-   * Preprocess text input
-   */
   protected override async preprocess(input: string | string[]): Promise<EdgeFlowTensor[]> {
     const text = Array.isArray(input) ? input[0]! : input;
     
-    // Tokenize
     const encoded = this.tokenizer!.encode(text, {
       maxLength: 128,
       padding: 'max_length',
       truncation: true,
     });
 
-    // Create tensors
     const inputIds = new EdgeFlowTensor(
-      new Float32Array(encoded.inputIds),
+      BigInt64Array.from(encoded.inputIds.map(id => BigInt(id))),
       [1, encoded.inputIds.length],
-      'float32'
+      'int64'
     );
 
     const attentionMask = new EdgeFlowTensor(
-      new Float32Array(encoded.attentionMask),
+      BigInt64Array.from(encoded.attentionMask.map(m => BigInt(m))),
       [1, encoded.attentionMask.length],
-      'float32'
+      'int64'
     );
 
     return [inputIds, attentionMask];
   }
 
-  /**
-   * Run model inference
-   */
   private async runInference(inputs: EdgeFlowTensor[]): Promise<EdgeFlowTensor[]> {
-    // For demo: generate mock logits based on input
-    // In production, this would call the actual model
-    const numClasses = this.labels.length;
-    const logits = new Float32Array(numClasses);
-    
-    // Simple sentiment heuristic for demo
-    const inputData = inputs[0]?.toFloat32Array() ?? new Float32Array(0);
-    const sum = inputData.reduce((a, b) => a + b, 0);
-    
-    // Generate pseudo-random but deterministic scores
-    for (let i = 0; i < numClasses; i++) {
-      logits[i] = Math.sin(sum * (i + 1)) * 2;
-    }
+    const namedInputs = new Map<string, EdgeFlowTensor>();
+    namedInputs.set('input_ids', inputs[0]!);
+    namedInputs.set('attention_mask', inputs[1]!);
 
-    return [new EdgeFlowTensor(logits, [1, numClasses], 'float32')];
+    const outputs = await runInferenceNamed(this.onnxModel!, namedInputs);
+    return outputs as EdgeFlowTensor[];
   }
 
-  /**
-   * Postprocess model outputs
-   */
   protected override async postprocess(
     outputs: EdgeFlowTensor[],
     options?: TextClassificationOptions
@@ -180,20 +145,9 @@ export class TextClassificationPipeline extends BasePipeline<
       return { label: 'unknown', score: 0 };
     }
 
-    // Apply softmax
     const probs = softmax(logits, -1) as EdgeFlowTensor;
     const probsArray = probs.toFloat32Array();
 
-    // Get predictions
-    const topK = options?.topK ?? 1;
-    const returnAllScores = options?.returnAllScores ?? false;
-
-    if (returnAllScores || topK > 1) {
-      // Return multiple results - for simplicity, return top-1 here
-      // Full implementation would return sorted array
-    }
-
-    // Find argmax
     let maxIdx = 0;
     let maxScore = probsArray[0] ?? 0;
     
@@ -217,17 +171,11 @@ export class TextClassificationPipeline extends BasePipeline<
 // Sentiment Analysis Pipeline
 // ============================================================================
 
-/**
- * SentimentAnalysisPipeline - Specialized for sentiment analysis
- */
 export class SentimentAnalysisPipeline extends TextClassificationPipeline {
   constructor(config: PipelineConfig) {
     super(config, SENTIMENT_LABELS);
   }
 
-  /**
-   * Analyze sentiment
-   */
   async analyze(
     text: string | string[],
     options?: TextClassificationOptions
@@ -240,9 +188,6 @@ export class SentimentAnalysisPipeline extends TextClassificationPipeline {
 // Factory Functions
 // ============================================================================
 
-/**
- * Create text classification pipeline
- */
 export function createTextClassificationPipeline(
   config: Partial<PipelineConfig> = {}
 ): TextClassificationPipeline {
@@ -255,9 +200,6 @@ export function createTextClassificationPipeline(
   });
 }
 
-/**
- * Create sentiment analysis pipeline
- */
 export function createSentimentAnalysisPipeline(
   config: Partial<PipelineConfig> = {}
 ): SentimentAnalysisPipeline {
@@ -270,6 +212,5 @@ export function createSentimentAnalysisPipeline(
   });
 }
 
-// Register pipelines
 registerPipeline('text-classification', (config) => new TextClassificationPipeline(config));
 registerPipeline('sentiment-analysis', (config) => new SentimentAnalysisPipeline(config));

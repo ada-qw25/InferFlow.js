@@ -24,11 +24,21 @@ export class BasePipeline {
         this.downloadCache = new ModelDownloadCache();
     }
     /**
-     * Initialize the pipeline (load model)
+     * Initialize the pipeline (load model).
+     *
+     * Skips model loading when `config.model === 'default'` — concrete
+     * subclasses that define their own DEFAULT_MODELS handle all model
+     * loading in their overridden `initialize()` methods, so the base
+     * should not attempt to fetch a URL called "default".
      */
     async initialize() {
         if (this.isReady && this.model)
             return;
+        // Skip generic model loading for subclasses that manage their own models.
+        if (this.config.model === 'default') {
+            this.isReady = true;
+            return;
+        }
         // Check model cache first
         const cachedModel = this.modelCache.get(this.config.model);
         if (cachedModel) {
@@ -36,7 +46,7 @@ export class BasePipeline {
             this.isReady = true;
             return;
         }
-        // Load model
+        // Load model using the explicit URL from config
         this.model = await this.loadModelWithCache(this.config.model);
         this.isReady = true;
     }

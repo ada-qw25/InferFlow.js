@@ -49,6 +49,7 @@
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs",
+    "test:e2e": "playwright test",
     "prepublishOnly": "npm run clean && npm run build && npm run test"
   },
   "keywords": [
@@ -73,10 +74,17 @@
     "url": "https://github.com/s-zx/edgeflow.js/issues"
   },
   "homepage": "https://edgeflow.js.org",
-  "dependencies": {
+  "peerDependencies": {
     "onnxruntime-web": "^1.17.0"
   },
+  "peerDependenciesMeta": {
+    "onnxruntime-web": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "onnxruntime-web": "^1.17.0",
+    "@playwright/test": "^1.58.2",
     "@types/node": "^20.10.0",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",

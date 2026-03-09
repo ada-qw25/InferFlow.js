@@ -10,6 +10,7 @@ import {
 } from '../core/types.js';
 
 import { getPluginPipeline } from '../core/plugin.js';
+import { registerAllBackends } from '../backends/index.js';
 
 // Base
 export {
@@ -173,25 +174,14 @@ import { ImageSegmentationPipeline } from './image-segmentation.js';
  * });
  * ```
  */
-/**
- * Experimental tasks that use heuristic/mock inference instead of real models.
- * These work for demos but are not production-ready without a real model.
- */
-const EXPERIMENTAL_TASKS = new Set<string>([
-  'text-classification',
-  'sentiment-analysis',
-  'feature-extraction',
-  'image-classification',
-  'object-detection',
-  'automatic-speech-recognition',
-  'zero-shot-classification',
-  'question-answering',
-]);
-
 export async function pipeline<T extends keyof PipelineTaskMap>(
   task: T,
   options?: PipelineFactoryOptions
 ): Promise<PipelineTaskMap[T]> {
+  // Guarantee backends are registered before any model loads.
+  // registerAllBackends() is synchronous and idempotent (safe to call repeatedly).
+  registerAllBackends();
+
   const config: PipelineConfig = {
     task: task as PipelineTask,
     model: options?.model ?? 'default',
@@ -199,13 +189,6 @@ export async function pipeline<T extends keyof PipelineTaskMap>(
     cache: options?.cache ?? true,
     quantization: options?.quantization,
   };
-
-  if (EXPERIMENTAL_TASKS.has(task) && !options?.model) {
-    console.warn(
-      `[edgeFlow.js] Pipeline "${task}" is experimental without a real model. ` +
-      `Provide a model via options.model or use the transformers.js adapter for production accuracy.`
-    );
-  }
 
   type AllPipelines = TextClassificationPipeline | SentimentAnalysisPipeline | FeatureExtractionPipeline | ImageClassificationPipeline | TextGenerationPipeline | ObjectDetectionPipeline | AutomaticSpeechRecognitionPipeline | ZeroShotClassificationPipeline | QuestionAnsweringPipeline | ImageSegmentationPipeline;
   

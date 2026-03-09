@@ -1,40 +1,50 @@
 /**
  * edgeFlow.js - Automatic Speech Recognition Pipeline
  * 
- * Transcribe audio to text using Whisper and other ASR models.
+ * Transcribe audio to text using Whisper ONNX models (encoder + decoder).
  */
 
-import { BasePipeline, PipelineResult } from './base.js';
+import { BasePipeline, PipelineResult, registerPipeline } from './base.js';
 import { EdgeFlowTensor } from '../core/tensor.js';
-import { PipelineConfig, PipelineOptions } from '../core/types.js';
+import { PipelineConfig, PipelineOptions, LoadedModel } from '../core/types.js';
 import { AudioPreprocessor, type AudioInput } from '../utils/preprocessor.js';
 import { Tokenizer } from '../utils/tokenizer.js';
+import { loadModelData } from '../utils/model-loader.js';
+import { loadModelFromBuffer, runInference, runInferenceNamed } from '../core/runtime.js';
+
+// ============================================================================
+// Default Model (Whisper-tiny, quantized encoder + decoder)
+// ============================================================================
+
+const DEFAULT_MODELS = {
+  encoder: 'https://huggingface.co/Xenova/whisper-tiny/resolve/main/onnx/encoder_model_quantized.onnx',
+  decoder: 'https://huggingface.co/Xenova/whisper-tiny/resolve/main/onnx/decoder_model_merged_quantized.onnx',
+  tokenizer: 'https://huggingface.co/Xenova/whisper-tiny/resolve/main/tokenizer.json',
+};
+
+// Whisper special tokens
+const SOT_TOKEN = 50258;           // <|startoftranscript|>
+const TRANSLATE_TOKEN = 50358;     // <|translate|>
+const TRANSCRIBE_TOKEN = 50359;    // <|transcribe|>
+const EOT_TOKEN = 50257;           // <|endoftext|>
+const NO_TIMESTAMPS_TOKEN = 50363; // <|notimestamps|>
+const EN_TOKEN = 50259;            // <|en|>
+
+const MAX_DECODER_TOKENS = 448;
 
 // ============================================================================
 // Types
 // ============================================================================
 
-/**
- * ASR options
- */
 export interface ASROptions extends PipelineOptions {
-  /** Target language (for multilingual models) */
   language?: string;
-  /** Task: transcribe or translate */
   task?: 'transcribe' | 'translate';
-  /** Return timestamps */
   returnTimestamps?: boolean | 'word' | 'chunk';
-  /** Maximum duration to process (in seconds) */
   maxDuration?: number;
-  /** Chunk duration for long audio (in seconds) */
   chunkDuration?: number;
-  /** Overlap between chunks (in seconds) */
   chunkOverlap?: number;
 }
 
-/**
- * Word-level timestamp
- */
 export interface WordTimestamp {
   word: string;
   start: number;
@@ -42,26 +52,16 @@ export interface WordTimestamp {
   confidence?: number;
 }
 
-/**
- * Chunk-level timestamp
- */
 export interface ChunkTimestamp {
   text: string;
   start: number;
   end: number;
 }
 
-/**
- * ASR result
- */
 export interface ASRResult extends PipelineResult {
-  /** Transcribed text */
   text: string;
-  /** Detected language */
   language?: string;
-  /** Word-level timestamps */
   words?: WordTimestamp[];
-  /** Chunk-level timestamps */
   chunks?: ChunkTimestamp[];
 }
 
@@ -69,42 +69,25 @@ export interface ASRResult extends PipelineResult {
 // ASR Pipeline
 // ============================================================================
 
-/**
- * AutomaticSpeechRecognitionPipeline - Transcribe audio to text
- * 
- * @example
- * ```typescript
- * const asr = await pipeline('automatic-speech-recognition');
- * 
- * // Simple transcription
- * const result = await asr.run('audio.mp3');
- * console.log(result.text);
- * 
- * // With timestamps
- * const result = await asr.run('audio.mp3', { returnTimestamps: true });
- * for (const chunk of result.chunks) {
- *   console.log(`[${chunk.start.toFixed(2)}s] ${chunk.text}`);
- * }
- * ```
- */
-/**
- * **Status: Experimental** - Audio preprocessing works, but decoding is a stub.
- * For production use, pair with the transformers.js adapter backend or
- * provide a real Whisper ONNX model.
- */
 export class AutomaticSpeechRecognitionPipeline extends BasePipeline<AudioInput | AudioInput[], ASRResult | ASRResult[]> {
-  static readonly experimental = true;
-
   private audioPreprocessor: AudioPreprocessor;
   private tokenizer: Tokenizer | null = null;
+  private encoderModel: LoadedModel | null = null;
+  private decoderModel: LoadedModel | null = null;
+  private encoderUrl: string;
+  private decoderUrl: string;
+  private tokenizerUrl: string;
 
   constructor(config?: PipelineConfig) {
     super(config ?? {
       task: 'automatic-speech-recognition',
       model: 'default',
     });
-    
-    // Whisper-style preprocessing
+
+    this.encoderUrl = DEFAULT_MODELS.encoder;
+    this.decoderUrl = DEFAULT_MODELS.decoder;
+    this.tokenizerUrl = DEFAULT_MODELS.tokenizer;
+
     this.audioPreprocessor = new AudioPreprocessor({
       sampleRate: 16000,
       nMels: 80,
@@ -114,129 +97,167 @@ export class AutomaticSpeechRecognitionPipeline extends BasePipeline<AudioInput 
     });
   }
 
-  /**
-   * Set tokenizer for decoding
-   */
+  override async initialize(): Promise<void> {
+    await super.initialize();
+
+    if (!this.tokenizer) {
+      this.tokenizer = await Tokenizer.fromUrl(this.tokenizerUrl);
+    }
+
+    if (!this.encoderModel) {
+      const data = await loadModelData(this.encoderUrl, { cache: this.config.cache ?? true });
+      this.encoderModel = await loadModelFromBuffer(data);
+    }
+
+    if (!this.decoderModel) {
+      const data = await loadModelData(this.decoderUrl, { cache: this.config.cache ?? true });
+      this.decoderModel = await loadModelFromBuffer(data);
+    }
+  }
+
   setTokenizer(tokenizer: Tokenizer): void {
     this.tokenizer = tokenizer;
   }
 
-  /**
-   * Preprocess audio input
-   */
-  protected async preprocess(input: AudioInput | AudioInput[]): Promise<EdgeFlowTensor[]> {
-    const inputs = Array.isArray(input) ? input : [input];
-    
-    const tensors = await Promise.all(
-      inputs.map(audio => this.audioPreprocessor.process(audio))
-    );
-
-    // Stack into batch
-    if (tensors.length === 1) {
-      const t = tensors[0]!;
-      return [new EdgeFlowTensor(
-        t.toFloat32Array(),
-        [1, ...t.shape],
-        'float32'
-      )];
-    }
-
-    // TODO: Proper batching with padding
-    return tensors;
-  }
-
-  /**
-   * Postprocess model output
-   */
-  protected async postprocess(
-    outputs: EdgeFlowTensor[],
+  override async run(
+    input: AudioInput | AudioInput[],
     options?: PipelineOptions
   ): Promise<ASRResult | ASRResult[]> {
-    const opts = options as ASROptions ?? {};
-    const returnTimestamps = opts.returnTimestamps ?? false;
+    await this.initialize();
 
-    if (!outputs[0]) {
-      return { text: '' };
+    const isBatch = Array.isArray(input);
+    const inputs = isBatch ? input : [input];
+    const opts = options as ASROptions ?? {};
+
+    const results: ASRResult[] = [];
+    for (const audio of inputs) {
+      const result = await this.transcribeSingle(audio, opts);
+      results.push(result);
     }
 
-    const outputData = outputs[0].toFloat32Array();
-    const shape = outputs[0].shape;
+    return isBatch ? results : results[0]!;
+  }
 
-    // Decode tokens to text
-    const text = this.decodeOutput(outputData, shape);
+  private async transcribeSingle(audio: AudioInput, options: ASROptions): Promise<ASRResult> {
+    const startTime = performance.now();
 
-    const result: ASRResult = { text };
+    // 1. Preprocess audio → mel spectrogram
+    const melTensor = await this.audioPreprocessor.process(audio);
+    const melInput = new EdgeFlowTensor(
+      melTensor.toFloat32Array(),
+      [1, ...melTensor.shape],
+      'float32'
+    );
 
-    // Add timestamps if requested
-    if (returnTimestamps) {
-      result.chunks = this.extractTimestamps(outputData, shape, text);
+    // 2. Run encoder
+    const encoderOutputs = await runInference(this.encoderModel!, [melInput]);
+    const encoderHidden = encoderOutputs[0] as EdgeFlowTensor;
+
+    // 3. Autoregressive decoder loop
+    const task = options.task ?? 'transcribe';
+    const initialTokens = this.buildInitialTokens(task, options.language);
+
+    const generatedTokens = await this.autoregressiveDecode(
+      encoderHidden,
+      initialTokens,
+    );
+
+    // 4. Decode tokens to text
+    const text = this.tokenizer!.decode(generatedTokens, true);
+
+    const result: ASRResult = {
+      text: text.trim(),
+      processingTime: performance.now() - startTime,
+    };
+
+    if (options.returnTimestamps) {
+      result.chunks = this.extractTimestamps(generatedTokens, text);
     }
 
     return result;
   }
 
-  /**
-   * Decode model output to text
-   */
-  private decodeOutput(data: Float32Array, shape: readonly number[]): string {
-    // Get token IDs from output
-    const seqLen = shape[1] ?? data.length;
-    const vocabSize = shape[2] ?? 1;
-    
-    const tokenIds: number[] = [];
-    
-    if (vocabSize > 1) {
-      // Output is logits: [batch, seq_len, vocab_size]
-      for (let i = 0; i < seqLen; i++) {
-        const offset = i * vocabSize;
-        let maxIdx = 0;
-        let maxVal = data[offset] ?? -Infinity;
-        
-        for (let j = 1; j < vocabSize; j++) {
-          if ((data[offset + j] ?? -Infinity) > maxVal) {
-            maxVal = data[offset + j] ?? -Infinity;
-            maxIdx = j;
-          }
-        }
-        tokenIds.push(maxIdx);
-      }
-    } else {
-      // Output is token IDs directly
-      for (let i = 0; i < data.length; i++) {
-        tokenIds.push(Math.round(data[i] ?? 0));
-      }
-    }
+  private buildInitialTokens(task: 'transcribe' | 'translate', language?: string): number[] {
+    const tokens = [SOT_TOKEN];
+    tokens.push(language ? this.getLanguageToken(language) : EN_TOKEN);
+    tokens.push(task === 'translate' ? TRANSLATE_TOKEN : TRANSCRIBE_TOKEN);
+    tokens.push(NO_TIMESTAMPS_TOKEN);
+    return tokens;
+  }
 
-    // Decode using tokenizer
-    if (this.tokenizer) {
-      return this.tokenizer.decode(tokenIds, true);
-    }
-
-    // Fallback: return raw token IDs
-    return tokenIds.join(' ');
+  private getLanguageToken(language: string): number {
+    // Whisper language tokens start at 50259 for English
+    const langMap: Record<string, number> = {
+      en: 50259, zh: 50260, de: 50261, es: 50262, ru: 50263,
+      ko: 50264, fr: 50265, ja: 50266, pt: 50267, tr: 50268,
+      pl: 50269, ca: 50270, nl: 50271, ar: 50272, sv: 50273,
+      it: 50274, id: 50275, hi: 50276, fi: 50277, vi: 50278,
+    };
+    return langMap[language.toLowerCase()] ?? EN_TOKEN;
   }
 
   /**
-   * Extract timestamps from output
+   * Autoregressive decoder loop similar to text-generation.
+   * Feeds encoder hidden states + growing token sequence to decoder.
    */
+  private async autoregressiveDecode(
+    encoderHidden: EdgeFlowTensor,
+    initialTokens: number[],
+  ): Promise<number[]> {
+    const tokens = [...initialTokens];
+
+    for (let step = 0; step < MAX_DECODER_TOKENS; step++) {
+      const decoderInputIds = new EdgeFlowTensor(
+        BigInt64Array.from(tokens.map(t => BigInt(t))),
+        [1, tokens.length],
+        'int64'
+      );
+
+      const namedInputs = new Map<string, EdgeFlowTensor>();
+      namedInputs.set('input_ids', decoderInputIds);
+      namedInputs.set('encoder_hidden_states', encoderHidden);
+
+      const decoderOutputs = await runInferenceNamed(this.decoderModel!, namedInputs);
+      const logits = (decoderOutputs[0] as EdgeFlowTensor).toFloat32Array();
+
+      // Get logits for the last token position
+      const vocabSize = logits.length / tokens.length;
+      const lastTokenLogits = logits.slice((tokens.length - 1) * vocabSize);
+
+      // Greedy: argmax
+      let bestId = 0;
+      let bestVal = lastTokenLogits[0] ?? -Infinity;
+      for (let i = 1; i < lastTokenLogits.length; i++) {
+        if ((lastTokenLogits[i] ?? -Infinity) > bestVal) {
+          bestVal = lastTokenLogits[i] ?? -Infinity;
+          bestId = i;
+        }
+      }
+
+      if (bestId === EOT_TOKEN) break;
+
+      tokens.push(bestId);
+    }
+
+    // Strip initial tokens to return only generated tokens
+    return tokens.slice(initialTokens.length);
+  }
+
   private extractTimestamps(
-    _data: Float32Array,
-    _shape: readonly number[],
+    _tokenIds: number[],
     text: string
   ): ChunkTimestamp[] {
-    // Simplified: split text into chunks
-    // Real implementation would use model-specific timestamp tokens
+    // Simplified timestamp extraction: split by punctuation
     const words = text.split(/\s+/).filter(w => w.length > 0);
     const chunks: ChunkTimestamp[] = [];
-    
-    const wordsPerSecond = 2.5; // Rough estimate
+
+    const wordsPerSecond = 2.5;
     let chunkText = '';
     let chunkStart = 0;
-    
+
     for (let i = 0; i < words.length; i++) {
       chunkText += (chunkText ? ' ' : '') + words[i];
-      
-      // Create chunk every ~5 words
+
       if ((i + 1) % 5 === 0 || i === words.length - 1) {
         const duration = chunkText.split(/\s+/).length / wordsPerSecond;
         chunks.push({
@@ -252,37 +273,32 @@ export class AutomaticSpeechRecognitionPipeline extends BasePipeline<AudioInput 
     return chunks;
   }
 
-  /**
-   * Process long audio in chunks
-   */
   async processLongAudio(
     audio: AudioInput,
     options: ASROptions = {}
   ): Promise<ASRResult> {
     const chunkDuration = options.chunkDuration ?? 30;
     const chunkOverlap = options.chunkOverlap ?? 5;
-    
-    // Get raw audio data
+
     const rawTensor = await this.audioPreprocessor.processRaw(audio);
     const audioData = rawTensor.toFloat32Array();
     const sampleRate = 16000;
-    
+
     const chunkSamples = chunkDuration * sampleRate;
     const overlapSamples = chunkOverlap * sampleRate;
     const stepSamples = chunkSamples - overlapSamples;
-    
+
     const chunks: ASRResult[] = [];
-    
+
     for (let start = 0; start < audioData.length; start += stepSamples) {
       const end = Math.min(start + chunkSamples, audioData.length);
       const chunkAudio = audioData.slice(start, end);
-      
+
       const chunkResult = await this.run(
         new Float32Array(chunkAudio),
         options
       ) as ASRResult;
-      
-      // Add time offset to chunks
+
       if (chunkResult.chunks) {
         const timeOffset = start / sampleRate;
         chunkResult.chunks = chunkResult.chunks.map(c => ({
@@ -291,11 +307,10 @@ export class AutomaticSpeechRecognitionPipeline extends BasePipeline<AudioInput 
           end: c.end + timeOffset,
         }));
       }
-      
+
       chunks.push(chunkResult);
     }
 
-    // Merge results
     const mergedText = chunks.map(c => c.text).join(' ');
     const mergedChunks = chunks.flatMap(c => c.chunks ?? []);
 
@@ -303,6 +318,83 @@ export class AutomaticSpeechRecognitionPipeline extends BasePipeline<AudioInput 
       text: mergedText,
       chunks: mergedChunks,
     };
+  }
+
+  protected async preprocess(input: AudioInput | AudioInput[]): Promise<EdgeFlowTensor[]> {
+    const inputs = Array.isArray(input) ? input : [input];
+
+    const tensors = await Promise.all(
+      inputs.map(audio => this.audioPreprocessor.process(audio))
+    );
+
+    if (tensors.length === 1) {
+      const t = tensors[0]!;
+      return [new EdgeFlowTensor(
+        t.toFloat32Array(),
+        [1, ...t.shape],
+        'float32'
+      )];
+    }
+
+    return tensors;
+  }
+
+  protected async postprocess(
+    outputs: EdgeFlowTensor[],
+    options?: PipelineOptions
+  ): Promise<ASRResult | ASRResult[]> {
+    const opts = options as ASROptions ?? {};
+    const returnTimestamps = opts.returnTimestamps ?? false;
+
+    if (!outputs[0]) {
+      return { text: '' };
+    }
+
+    const outputData = outputs[0].toFloat32Array();
+    const shape = outputs[0].shape;
+
+    const text = this.decodeOutput(outputData, shape);
+
+    const result: ASRResult = { text };
+
+    if (returnTimestamps) {
+      result.chunks = this.extractTimestamps([], text);
+    }
+
+    return result;
+  }
+
+  private decodeOutput(data: Float32Array, shape: readonly number[]): string {
+    const seqLen = shape[1] ?? data.length;
+    const vocabSize = shape[2] ?? 1;
+
+    const tokenIds: number[] = [];
+
+    if (vocabSize > 1) {
+      for (let i = 0; i < seqLen; i++) {
+        const offset = i * vocabSize;
+        let maxIdx = 0;
+        let maxVal = data[offset] ?? -Infinity;
+
+        for (let j = 1; j < vocabSize; j++) {
+          if ((data[offset + j] ?? -Infinity) > maxVal) {
+            maxVal = data[offset + j] ?? -Infinity;
+            maxIdx = j;
+          }
+        }
+        tokenIds.push(maxIdx);
+      }
+    } else {
+      for (let i = 0; i < data.length; i++) {
+        tokenIds.push(Math.round(data[i] ?? 0));
+      }
+    }
+
+    if (this.tokenizer) {
+      return this.tokenizer.decode(tokenIds, true);
+    }
+
+    return tokenIds.join(' ');
   }
 }
 
@@ -313,3 +405,5 @@ export class AutomaticSpeechRecognitionPipeline extends BasePipeline<AudioInput 
 export function createASRPipeline(config?: PipelineConfig): AutomaticSpeechRecognitionPipeline {
   return new AutomaticSpeechRecognitionPipeline(config);
 }
+
+registerPipeline('automatic-speech-recognition', (config) => new AutomaticSpeechRecognitionPipeline(config));

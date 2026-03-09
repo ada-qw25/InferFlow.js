@@ -1,11 +1,12 @@
 /**
  * edgeFlow.js - WebNN Backend
  *
- * Browser-native neural network acceleration using the Web Neural Network API.
- * Features:
- * - Hardware-accelerated inference
- * - Native browser integration
- * - Fallback to CPU when GPU unavailable
+ * **Status: Planned** - This is a skeleton implementation that initializes
+ * a WebNN context but does not perform real model inference or graph building.
+ * For hardware-accelerated inference, use the ONNX Runtime backend which
+ * supports WebNN via its execution providers when available.
+ *
+ * This backend is intended for future native WebNN graph building support.
  */
 import { EdgeFlowError, ErrorCodes, } from '../core/types.js';
 import { LoadedModelImpl } from '../core/runtime.js';

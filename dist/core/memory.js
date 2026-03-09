@@ -191,28 +191,64 @@ export class MemoryManager {
         }
     }
     /**
-     * Garbage collection helper
+     * Garbage collection helper.
+     *
+     * Identifies stale resources and optionally evicts them.
+     * @param evict - If true, actually dispose stale resources (default: false)
+     * @param maxAge - Resources older than this (ms) are considered stale (default: 5 min)
      */
-    gc() {
+    gc(evict = false, maxAge = 5 * 60 * 1000) {
         this.emit('memory:gc', { before: this.allocated });
-        // In browser environment, we can only suggest GC
-        // by releasing unused resources
-        // Find old resources that might be unused
         const now = Date.now();
-        const oldResources = [];
+        const staleIds = [];
         for (const [id, resource] of this.resources) {
-            // Resources older than 5 minutes might be candidates for cleanup
-            if (now - resource.createdAt > 5 * 60 * 1000) {
-                oldResources.push(id);
+            if (now - resource.createdAt > maxAge) {
+                staleIds.push(id);
             }
         }
-        // Note: We don't automatically release old resources
-        // This is just for reporting purposes
-        // Actual cleanup should be done by the user
+        if (evict) {
+            for (const id of staleIds) {
+                this.release(id);
+            }
+        }
         this.emit('memory:gc', {
             after: this.allocated,
-            potentialCleanup: oldResources.length,
+            evicted: evict ? staleIds.length : 0,
+            potentialCleanup: staleIds.length,
         });
+    }
+    /**
+     * Query actual browser memory usage via performance.measureUserAgentSpecificMemory()
+     * (Chrome 89+, requires cross-origin isolation). Returns null if unavailable.
+     */
+    async measureBrowserMemory() {
+        try {
+            if (typeof performance !== 'undefined' &&
+                'measureUserAgentSpecificMemory' in performance) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const result = await performance.measureUserAgentSpecificMemory();
+                return result;
+            }
+        }
+        catch {
+            // Not available or not cross-origin isolated
+        }
+        return null;
+    }
+    /**
+     * Get the device's total memory hint (navigator.deviceMemory).
+     * Returns null if unavailable. Value is in GiB, rounded (e.g. 4, 8).
+     */
+    getDeviceMemory() {
+        try {
+            if (typeof navigator !== 'undefined' && 'deviceMemory' in navigator) {
+                return navigator.deviceMemory ?? null;
+            }
+        }
+        catch {
+            // Not available
+        }
+        return null;
     }
     /**
      * Get memory statistics

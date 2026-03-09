@@ -21,18 +21,26 @@ export function serializeTensor(tensor) {
     };
 }
 /**
- * Deserialize a tensor from worker
+ * Deserialize a tensor from worker.
+ * Uses a lazy import to avoid circular dependency issues.
  */
-export function deserializeTensor(serialized) {
-    const { EdgeFlowTensor } = require('./tensor.js');
+export async function deserializeTensor(serialized) {
+    const { EdgeFlowTensor } = await import('./tensor.js');
     const data = new Float32Array(serialized.data);
     return new EdgeFlowTensor(data, serialized.shape, serialized.dtype);
 }
-// ============================================================================
-// Worker Manager
-// ============================================================================
 /**
- * InferenceWorker - Wrapper for a single Web Worker
+ * Synchronous deserialisation used internally where async is not feasible.
+ * Requires EdgeFlowTensor to be passed in to avoid require().
+ */
+export function deserializeTensorSync(serialized, TensorClass) {
+    const data = new Float32Array(serialized.data);
+    return new TensorClass(data, serialized.shape, serialized.dtype);
+}
+const MAX_RESTART_ATTEMPTS = 3;
+const RESTART_BASE_DELAY_MS = 1000;
+/**
+ * InferenceWorker - Wrapper for a single Web Worker with auto-restart
  */
 export class InferenceWorker {
     worker = null;
@@ -40,17 +48,23 @@ export class InferenceWorker {
     isReady = false;
     readyPromise;
     readyResolve;
+    workerUrl;
+    _health = 'alive';
+    restartAttempts = 0;
     constructor(workerUrl) {
+        this.workerUrl = workerUrl;
         this.readyPromise = new Promise(resolve => {
             this.readyResolve = resolve;
         });
         this.initWorker(workerUrl);
     }
+    get health() {
+        return this._health;
+    }
     /**
      * Initialize the worker
      */
     initWorker(workerUrl) {
-        // Create worker from blob if no URL provided
         const url = workerUrl ?? this.createWorkerBlob();
         this.worker = new Worker(url, { type: 'module' });
         this.worker.onmessage = (event) => {
@@ -58,12 +72,64 @@ export class InferenceWorker {
         };
         this.worker.onerror = (error) => {
             console.error('Worker error:', error);
-            // Reject all pending requests
-            for (const [, { reject }] of this.pendingRequests) {
-                reject(new Error('Worker error'));
-            }
-            this.pendingRequests.clear();
+            this.handleCrash();
         };
+        this.worker.onmessageerror = () => {
+            this.handleCrash();
+        };
+    }
+    /**
+     * Handle worker crash: reject pending, mark dead, attempt restart
+     */
+    handleCrash() {
+        this._health = 'dead';
+        this.isReady = false;
+        const crashError = new Error('Worker crashed');
+        for (const [, { reject }] of this.pendingRequests) {
+            reject(crashError);
+        }
+        this.pendingRequests.clear();
+        this.attemptRestart();
+    }
+    /**
+     * Restart the worker with exponential backoff
+     */
+    attemptRestart() {
+        if (this.restartAttempts >= MAX_RESTART_ATTEMPTS) {
+            console.error(`Worker failed to restart after ${MAX_RESTART_ATTEMPTS} attempts`);
+            return;
+        }
+        this._health = 'restarting';
+        const delay = RESTART_BASE_DELAY_MS * Math.pow(2, this.restartAttempts);
+        this.restartAttempts++;
+        setTimeout(() => {
+            this.restart();
+        }, delay);
+    }
+    /**
+     * Restart: terminate old, create new
+     */
+    restart() {
+        if (this.worker) {
+            try {
+                this.worker.terminate();
+            }
+            catch { /* already dead */ }
+            this.worker = null;
+        }
+        this.readyPromise = new Promise(resolve => {
+            this.readyResolve = resolve;
+        });
+        this.isReady = false;
+        try {
+            this.initWorker(this.workerUrl);
+            this._health = 'alive';
+            this.restartAttempts = 0;
+        }
+        catch {
+            this._health = 'dead';
+            this.attemptRestart();
+        }
     }
     /**
      * Create worker code as blob URL
@@ -240,7 +306,7 @@ export class InferenceWorker {
     async runInference(modelId, inputs) {
         const serializedInputs = inputs.map(serializeTensor);
         const result = await this.sendRequest('run_inference', { modelId, inputs: serializedInputs });
-        return result.outputs.map(deserializeTensor);
+        return Promise.all(result.outputs.map(deserializeTensor));
     }
     /**
      * Dispose a model
@@ -263,13 +329,16 @@ export class InferenceWorker {
 // Worker Pool
 // ============================================================================
 /**
- * WorkerPool - Manage multiple workers for parallel inference
+ * WorkerPool - Manage multiple workers for parallel inference.
+ * Automatically falls back to healthy workers when one is dead.
  */
 export class WorkerPool {
     workers = [];
     currentIndex = 0;
     modelAssignments = new Map();
+    poolOptions;
     constructor(options = {}) {
+        this.poolOptions = options;
         const numWorkers = options.numWorkers ??
             (typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : 4) ?? 4;
         for (let i = 0; i < numWorkers; i++) {
@@ -277,22 +346,47 @@ export class WorkerPool {
         }
     }
     /**
-     * Get next worker (round-robin)
+     * Get next healthy worker (round-robin, skipping dead ones)
      */
-    getNextWorker() {
-        const worker = this.workers[this.currentIndex];
-        this.currentIndex = (this.currentIndex + 1) % this.workers.length;
+    getNextHealthyWorker() {
+        const len = this.workers.length;
+        for (let attempt = 0; attempt < len; attempt++) {
+            const worker = this.workers[this.currentIndex];
+            this.currentIndex = (this.currentIndex + 1) % len;
+            if (worker.health === 'alive')
+                return worker;
+        }
+        // All dead — try restarting first one and return it
+        const worker = this.workers[0];
+        if (worker.health === 'dead')
+            worker.restart();
         return worker;
     }
     /**
-     * Get worker for a specific model
+     * Get worker for a specific model, falling back to any healthy worker
      */
     getWorkerForModel(modelId) {
         const index = this.modelAssignments.get(modelId);
         if (index !== undefined) {
-            return this.workers[index];
+            const worker = this.workers[index];
+            if (worker.health === 'alive')
+                return worker;
+            // Assigned worker is dead — pick a healthy one and reassign
+            const replacement = this.getNextHealthyWorker();
+            this.modelAssignments.set(modelId, this.workers.indexOf(replacement));
+            return replacement;
         }
-        return this.getNextWorker();
+        return this.getNextHealthyWorker();
+    }
+    /**
+     * Replace a worker at a given index with a fresh one
+     */
+    replaceWorker(index) {
+        if (index < 0 || index >= this.workers.length)
+            return;
+        const old = this.workers[index];
+        old.terminate();
+        this.workers[index] = new InferenceWorker(this.poolOptions.workerUrl);
     }
     /**
      * Initialize all workers
@@ -304,13 +398,13 @@ export class WorkerPool {
      * Load a model on a worker
      */
     async loadModel(url, options) {
-        const worker = this.getNextWorker();
+        const worker = this.getNextHealthyWorker();
         const modelId = await worker.loadModel(url, options);
         this.modelAssignments.set(modelId, this.workers.indexOf(worker));
         return modelId;
     }
     /**
-     * Run inference
+     * Run inference (auto-retries on a healthy worker if assigned one is dead)
      */
     async runInference(modelId, inputs) {
         const worker = this.getWorkerForModel(modelId);
@@ -320,7 +414,6 @@ export class WorkerPool {
      * Run inference on multiple inputs in parallel
      */
     async runBatch(modelId, batchInputs) {
-        // Distribute across workers
         const results = await Promise.all(batchInputs.map((inputs, i) => {
             const worker = this.workers[i % this.workers.length];
             return worker.runInference(modelId, inputs);

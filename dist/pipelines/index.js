@@ -1,6 +1,8 @@
 /**
  * edgeFlow.js - Pipeline Exports
  */
+import { getPluginPipeline } from '../core/plugin.js';
+import { registerAllBackends } from '../backends/index.js';
 // Base
 export { BasePipeline, registerPipeline, getPipelineFactory, SENTIMENT_LABELS, EMOTION_LABELS, IMAGENET_LABELS, } from './base.js';
 // Text Classification
@@ -47,6 +49,9 @@ import { ImageSegmentationPipeline } from './image-segmentation.js';
  * ```
  */
 export async function pipeline(task, options) {
+    // Guarantee backends are registered before any model loads.
+    // registerAllBackends() is synchronous and idempotent (safe to call repeatedly).
+    registerAllBackends();
     const config = {
         task: task,
         model: options?.model ?? 'default',
@@ -86,8 +91,16 @@ export async function pipeline(task, options) {
         case 'image-segmentation':
             pipelineInstance = new ImageSegmentationPipeline(config);
             break;
-        default:
-            throw new Error(`Unknown pipeline task: ${task}`);
+        default: {
+            // Check if a plugin provides this pipeline task
+            const pluginEntry = getPluginPipeline(task);
+            if (pluginEntry) {
+                pipelineInstance = pluginEntry.factory(config);
+                break;
+            }
+            throw new Error(`Unknown pipeline task: "${task}". ` +
+                `Register a plugin with registerPlugin() to add custom pipeline tasks.`);
+        }
     }
     // Initialize the pipeline
     await pipelineInstance.initialize();

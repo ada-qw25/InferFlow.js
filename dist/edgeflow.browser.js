@@ -866,15 +866,22 @@ async function loadModelData(url, options = {}) {
   if (cache && !forceDownload) {
     const cached = await modelCache.getModel(url);
     if (cached) {
-      console.log(`\u2713 Model loaded from cache: ${url}`);
-      options.onProgress?.({
-        loaded: cached.byteLength,
-        total: cached.byteLength,
-        percent: 100,
-        speed: 0,
-        eta: 0
-      });
-      return cached;
+      const firstByte = new Uint8Array(cached)[0];
+      const isHtmlOrText = firstByte === 60 || firstByte === 123;
+      if (isHtmlOrText || cached.byteLength < 1024) {
+        console.warn(`[edgeFlow.js] Cached model for ${url} appears corrupt (${cached.byteLength} bytes, first byte 0x${firstByte?.toString(16)}). Evicting and re-downloading.`);
+        await modelCache.deleteModel(url);
+      } else {
+        console.log(`\u2713 Model loaded from cache: ${url}`);
+        options.onProgress?.({
+          loaded: cached.byteLength,
+          total: cached.byteLength,
+          percent: 100,
+          speed: 0,
+          eta: 0
+        });
+        return cached;
+      }
     }
   }
   let data;
@@ -987,30 +994,86 @@ var init_model_loader = __esm({
         });
       }
       /**
-       * Save model metadata
+       * Save model metadata (with quota error handling)
        */
       async saveMeta(meta) {
+        try {
+          await this.putInStore(STORE_META, meta);
+        } catch (err) {
+          if (this.isQuotaError(err)) {
+            await this.evictOldest(meta.size);
+            try {
+              await this.putInStore(STORE_META, meta);
+            } catch {
+              console.warn("[edgeFlow.js] IndexedDB quota exceeded even after eviction; skipping cache.");
+            }
+          } else {
+            throw err;
+          }
+        }
+      }
+      /**
+       * Save a chunk (with quota error handling)
+       */
+      async saveChunk(url, index, data) {
+        try {
+          await this.putInStore(STORE_CHUNKS, { url, index, data });
+        } catch (err) {
+          if (this.isQuotaError(err)) {
+            await this.evictOldest(data.byteLength);
+            try {
+              await this.putInStore(STORE_CHUNKS, { url, index, data });
+            } catch {
+              console.warn("[edgeFlow.js] IndexedDB quota exceeded even after eviction; skipping cache for chunk.");
+            }
+          } else {
+            throw err;
+          }
+        }
+      }
+      /**
+       * Generic put helper
+       */
+      async putInStore(storeName, value) {
         const db = await this.openDB();
         return new Promise((resolve, reject) => {
-          const tx = db.transaction(STORE_META, "readwrite");
-          const store = tx.objectStore(STORE_META);
-          store.put(meta);
+          const tx = db.transaction(storeName, "readwrite");
+          const store = tx.objectStore(storeName);
+          store.put(value);
           tx.oncomplete = () => resolve();
           tx.onerror = () => reject(tx.error);
         });
       }
       /**
-       * Save a chunk
+       * Detect IndexedDB quota exceeded errors
        */
-      async saveChunk(url, index, data) {
+      isQuotaError(err) {
+        if (err instanceof DOMException) {
+          return err.name === "QuotaExceededError" || err.code === 22;
+        }
+        return false;
+      }
+      /**
+       * Evict oldest cached models to free space.
+       * Deletes models by ascending `cachedAt` until at least `bytesNeeded` is freed.
+       */
+      async evictOldest(bytesNeeded) {
         const db = await this.openDB();
-        return new Promise((resolve, reject) => {
-          const tx = db.transaction(STORE_CHUNKS, "readwrite");
-          const store = tx.objectStore(STORE_CHUNKS);
-          store.put({ url, index, data });
-          tx.oncomplete = () => resolve();
-          tx.onerror = () => reject(tx.error);
+        const allMeta = await new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE_META, "readonly");
+          const store = tx.objectStore(STORE_META);
+          const request = store.getAll();
+          request.onsuccess = () => resolve(request.result ?? []);
+          request.onerror = () => reject(request.error);
         });
+        allMeta.sort((a, b) => a.cachedAt - b.cachedAt);
+        let freed = 0;
+        for (const meta of allMeta) {
+          if (freed >= bytesNeeded)
+            break;
+          await this.deleteModel(meta.url);
+          freed += meta.size;
+        }
       }
       /**
        * Get all chunks for a URL
@@ -1050,17 +1113,18 @@ var init_model_loader = __esm({
         return result.buffer;
       }
       /**
-       * Save download state (for resume)
+       * Save download state (for resume, with quota handling)
        */
       async saveDownloadState(state) {
-        const db = await this.openDB();
-        return new Promise((resolve, reject) => {
-          const tx = db.transaction(STORE_STATE, "readwrite");
-          const store = tx.objectStore(STORE_STATE);
-          store.put(state);
-          tx.oncomplete = () => resolve();
-          tx.onerror = () => reject(tx.error);
-        });
+        try {
+          await this.putInStore(STORE_STATE, state);
+        } catch (err) {
+          if (this.isQuotaError(err)) {
+            console.warn("[edgeFlow.js] IndexedDB quota exceeded saving download state; resume may not work.");
+          } else {
+            throw err;
+          }
+        }
       }
       /**
        * Get download state
@@ -1465,7 +1529,12 @@ var DEFAULT_OPTIONS = {
   defaultTimeout: 3e4,
   enableBatching: false,
   maxBatchSize: 32,
-  batchTimeout: 50
+  batchTimeout: 50,
+  maxRetries: 0,
+  retryBaseDelay: 1e3,
+  circuitBreaker: false,
+  circuitBreakerThreshold: 5,
+  circuitBreakerResetTimeout: 3e4
 };
 var InferenceScheduler = class {
   constructor(options = {}) {
@@ -1475,10 +1544,67 @@ var InferenceScheduler = class {
     __publicField(this, "allTasks", /* @__PURE__ */ new Map());
     __publicField(this, "batchers", /* @__PURE__ */ new Map());
     __publicField(this, "listeners", /* @__PURE__ */ new Map());
+    __publicField(this, "circuits", /* @__PURE__ */ new Map());
     __publicField(this, "globalRunningCount", 0);
     __publicField(this, "isProcessing", false);
     __publicField(this, "disposed", false);
     this.options = { ...DEFAULT_OPTIONS, ...options };
+  }
+  /**
+   * Get circuit breaker state for a model, creating default if absent
+   */
+  getCircuit(modelId) {
+    let c = this.circuits.get(modelId);
+    if (!c) {
+      c = { failures: 0, state: "closed", lastFailure: 0 };
+      this.circuits.set(modelId, c);
+    }
+    return c;
+  }
+  /**
+   * Check if the circuit for a model allows new tasks
+   */
+  isCircuitOpen(modelId) {
+    if (!this.options.circuitBreaker)
+      return false;
+    const c = this.getCircuit(modelId);
+    if (c.state === "closed")
+      return false;
+    if (c.state === "open") {
+      if (Date.now() - c.lastFailure > this.options.circuitBreakerResetTimeout) {
+        c.state = "half-open";
+        return false;
+      }
+      return true;
+    }
+    return false;
+  }
+  /**
+   * Record a success for circuit breaker
+   */
+  circuitSuccess(modelId) {
+    if (!this.options.circuitBreaker)
+      return;
+    const c = this.getCircuit(modelId);
+    c.failures = 0;
+    c.state = "closed";
+  }
+  /**
+   * Record a failure for circuit breaker
+   */
+  circuitFailure(modelId) {
+    if (!this.options.circuitBreaker)
+      return;
+    const c = this.getCircuit(modelId);
+    c.failures++;
+    c.lastFailure = Date.now();
+    if (c.failures >= this.options.circuitBreakerThreshold) {
+      c.state = "open";
+      this.emit("inference:error", {
+        modelId,
+        error: new Error(`Circuit breaker opened after ${c.failures} consecutive failures`)
+      });
+    }
   }
   /**
    * Get or create queue for a model
@@ -1580,7 +1706,39 @@ var InferenceScheduler = class {
     if (this.disposed) {
       throw new EdgeFlowError("Scheduler has been disposed", ErrorCodes.RUNTIME_NOT_INITIALIZED);
     }
-    const task = new Task(generateTaskId(), modelId, priority, executor);
+    if (this.isCircuitOpen(modelId)) {
+      throw new EdgeFlowError(`Circuit breaker is open for model ${modelId} \u2014 too many consecutive failures. Retry after ${this.options.circuitBreakerResetTimeout}ms.`, ErrorCodes.INFERENCE_FAILED, { modelId });
+    }
+    const maxRetries = this.options.maxRetries;
+    const baseDelay = this.options.retryBaseDelay;
+    const wrappedExecutor = maxRetries > 0 ? async () => {
+      let lastError;
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          const result = await executor();
+          this.circuitSuccess(modelId);
+          return result;
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          this.circuitFailure(modelId);
+          if (attempt < maxRetries) {
+            const delay = baseDelay * Math.pow(2, attempt);
+            await new Promise((r) => setTimeout(r, delay));
+          }
+        }
+      }
+      throw lastError;
+    } : async () => {
+      try {
+        const result = await executor();
+        this.circuitSuccess(modelId);
+        return result;
+      } catch (err) {
+        this.circuitFailure(modelId);
+        throw err;
+      }
+    };
+    const task = new Task(generateTaskId(), modelId, priority, wrappedExecutor);
     this.allTasks.set(task.id, task);
     const queue = this.getQueue(modelId);
     queue.enqueue(task);
@@ -1945,21 +2103,58 @@ var _MemoryManager = class _MemoryManager {
     }
   }
   /**
-   * Garbage collection helper
+   * Garbage collection helper.
+   *
+   * Identifies stale resources and optionally evicts them.
+   * @param evict - If true, actually dispose stale resources (default: false)
+   * @param maxAge - Resources older than this (ms) are considered stale (default: 5 min)
    */
-  gc() {
+  gc(evict = false, maxAge = 5 * 60 * 1e3) {
     this.emit("memory:gc", { before: this.allocated });
     const now = Date.now();
-    const oldResources = [];
+    const staleIds = [];
     for (const [id, resource] of this.resources) {
-      if (now - resource.createdAt > 5 * 60 * 1e3) {
-        oldResources.push(id);
+      if (now - resource.createdAt > maxAge) {
+        staleIds.push(id);
+      }
+    }
+    if (evict) {
+      for (const id of staleIds) {
+        this.release(id);
       }
     }
     this.emit("memory:gc", {
       after: this.allocated,
-      potentialCleanup: oldResources.length
+      evicted: evict ? staleIds.length : 0,
+      potentialCleanup: staleIds.length
     });
+  }
+  /**
+   * Query actual browser memory usage via performance.measureUserAgentSpecificMemory()
+   * (Chrome 89+, requires cross-origin isolation). Returns null if unavailable.
+   */
+  async measureBrowserMemory() {
+    try {
+      if (typeof performance !== "undefined" && "measureUserAgentSpecificMemory" in performance) {
+        const result = await performance.measureUserAgentSpecificMemory();
+        return result;
+      }
+    } catch {
+    }
+    return null;
+  }
+  /**
+   * Get the device's total memory hint (navigator.deviceMemory).
+   * Returns null if unavailable. Value is in GiB, rounded (e.g. 4, 8).
+   */
+  getDeviceMemory() {
+    try {
+      if (typeof navigator !== "undefined" && "deviceMemory" in navigator) {
+        return navigator.deviceMemory ?? null;
+      }
+    } catch {
+    }
+    return null;
   }
   /**
    * Get memory statistics
@@ -2518,6 +2713,148 @@ async function getBestRuntime() {
 }
 async function getAvailableRuntimes() {
   return RuntimeManager.getInstance().detectAvailableRuntimes();
+}
+
+// dist/core/plugin.js
+var registeredPlugins = /* @__PURE__ */ new Map();
+var pluginPipelines = /* @__PURE__ */ new Map();
+var pluginMiddleware = [];
+async function registerPlugin(plugin) {
+  if (registeredPlugins.has(plugin.name)) {
+    console.warn(`[edgeFlow.js] Plugin "${plugin.name}" is already registered \u2014 skipping.`);
+    return;
+  }
+  if (plugin.setup) {
+    await plugin.setup();
+  }
+  if (plugin.pipelines) {
+    for (const [task, entry] of Object.entries(plugin.pipelines)) {
+      pluginPipelines.set(task, entry);
+    }
+  }
+  if (plugin.backends) {
+    for (const [name, entry] of Object.entries(plugin.backends)) {
+      registerRuntime(name, entry.factory);
+    }
+  }
+  if (plugin.middleware) {
+    pluginMiddleware.push(...plugin.middleware);
+  }
+  registeredPlugins.set(plugin.name, plugin);
+}
+function getPluginPipeline(task) {
+  return pluginPipelines.get(task);
+}
+function getPluginMiddleware() {
+  return pluginMiddleware;
+}
+function listPlugins() {
+  return Array.from(registeredPlugins.values()).map((p) => ({
+    name: p.name,
+    version: p.version
+  }));
+}
+function unregisterPlugin(name) {
+  const plugin = registeredPlugins.get(name);
+  if (!plugin)
+    return false;
+  if (plugin.pipelines) {
+    for (const task of Object.keys(plugin.pipelines)) {
+      pluginPipelines.delete(task);
+    }
+  }
+  if (plugin.middleware) {
+    for (const mw of plugin.middleware) {
+      const idx = pluginMiddleware.indexOf(mw);
+      if (idx !== -1)
+        pluginMiddleware.splice(idx, 1);
+    }
+  }
+  registeredPlugins.delete(name);
+  return true;
+}
+
+// dist/core/device-profiler.js
+var cachedProfile = null;
+async function getDeviceProfile() {
+  if (cachedProfile)
+    return cachedProfile;
+  const cores = typeof navigator !== "undefined" ? navigator.hardwareConcurrency ?? 2 : 2;
+  const memoryGiB = typeof navigator !== "undefined" && "deviceMemory" in navigator ? navigator.deviceMemory ?? null : null;
+  const mobile = typeof navigator !== "undefined" ? /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) : false;
+  let webgpu = false;
+  let gpuInfo;
+  if (typeof navigator !== "undefined" && "gpu" in navigator) {
+    try {
+      const adapter = await navigator.gpu.requestAdapter();
+      webgpu = adapter != null;
+      if (adapter && typeof adapter === "object") {
+        try {
+          const info = adapter["info"];
+          if (info) {
+            gpuInfo = `${info["vendor"] ?? ""} ${info["architecture"] ?? ""}`.trim() || void 0;
+          }
+        } catch {
+        }
+      }
+    } catch {
+    }
+  }
+  let webnn = false;
+  if (typeof navigator !== "undefined" && "ml" in navigator) {
+    try {
+      const ml = navigator.ml;
+      if (ml) {
+        const ctx = await ml.createContext();
+        webnn = ctx != null;
+      }
+    } catch {
+    }
+  }
+  let tier;
+  if (webgpu && cores >= 8 && (memoryGiB === null || memoryGiB >= 8)) {
+    tier = "high";
+  } else if (cores >= 4 && (memoryGiB === null || memoryGiB >= 4)) {
+    tier = "medium";
+  } else {
+    tier = "low";
+  }
+  if (mobile && tier === "high") {
+    tier = "medium";
+  }
+  const recommendedBatchSize = tier === "high" ? 32 : tier === "medium" ? 8 : 1;
+  const recommendedConcurrency = tier === "high" ? 4 : tier === "medium" ? 2 : 1;
+  cachedProfile = {
+    tier,
+    cores,
+    memoryGiB,
+    webgpu,
+    webnn,
+    recommendedBatchSize,
+    recommendedConcurrency,
+    mobile,
+    gpuInfo
+  };
+  return cachedProfile;
+}
+function recommendQuantization(profile) {
+  if (profile.tier === "high" && profile.webgpu)
+    return "float16";
+  if (profile.tier === "medium")
+    return "int8";
+  return "int8";
+}
+async function recommendModelVariant() {
+  const profile = await getDeviceProfile();
+  return {
+    quantization: recommendQuantization(profile),
+    executionProvider: profile.webgpu ? "webgpu" : "wasm",
+    batchSize: profile.recommendedBatchSize,
+    useWorker: profile.cores >= 4
+  };
+}
+function resetDeviceProfile() {
+  cachedProfile = null;
 }
 
 // dist/backends/webgpu.js
@@ -3308,8 +3645,21 @@ function createWASMRuntime() {
 
 // dist/backends/onnx.js
 init_types();
-import * as ort from "onnxruntime-web";
 init_tensor();
+var ort = null;
+async function getOrt() {
+  if (ort)
+    return ort;
+  try {
+    ort = await import("onnxruntime-web/wasm");
+    return ort;
+  } catch {
+    return null;
+  }
+}
+async function isOnnxAvailable() {
+  return await getOrt() != null;
+}
 var sessionStore = /* @__PURE__ */ new Map();
 var ONNXRuntime = class {
   constructor() {
@@ -3330,10 +3680,10 @@ var ONNXRuntime = class {
     };
   }
   /**
-   * Check if ONNX Runtime is available
+   * Check if ONNX Runtime is available (peer dependency installed)
    */
   async isAvailable() {
-    return true;
+    return isOnnxAvailable();
   }
   /**
    * Initialize the ONNX runtime
@@ -3341,8 +3691,13 @@ var ONNXRuntime = class {
   async initialize() {
     if (this.initialized)
       return;
-    if (typeof window !== "undefined") {
-      ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/";
+    const ortModule = await getOrt();
+    if (!ortModule) {
+      throw new EdgeFlowError("onnxruntime-web is not installed. Install it with: npm install onnxruntime-web", ErrorCodes.RUNTIME_NOT_AVAILABLE);
+    }
+    if (typeof window !== "undefined" && ortModule.env?.wasm) {
+      ortModule.env.wasm.wasmPaths = "/ort/";
+      ortModule.env.wasm.numThreads = 1;
     }
     this.initialized = true;
   }
@@ -3354,25 +3709,16 @@ var ONNXRuntime = class {
       await this.initialize();
     }
     try {
+      const ortModule = await getOrt();
+      if (!ortModule) {
+        throw new Error("onnxruntime-web is not installed");
+      }
       const sessionOptions = {
-        executionProviders: ["webgpu", "wasm"],
-        // Try WebGPU first, fallback to WASM
+        executionProviders: ["wasm"],
         graphOptimizationLevel: "all"
       };
       const modelBytes = new Uint8Array(modelData);
-      let session;
-      try {
-        session = await ort.InferenceSession.create(modelBytes, sessionOptions);
-        console.log("[ONNX] Session created (tried WebGPU \u2192 WASM)");
-      } catch (e) {
-        console.log("[ONNX] WebGPU not available, falling back to WASM. Reason:", e instanceof Error ? e.message : e);
-        const wasmOptions = {
-          executionProviders: ["wasm"],
-          graphOptimizationLevel: "all"
-        };
-        session = await ort.InferenceSession.create(modelBytes, wasmOptions);
-        console.log("[ONNX] Session created with WASM backend");
-      }
+      const session = await ortModule.InferenceSession.create(modelBytes, sessionOptions);
       const inputNames = session.inputNames;
       const outputNames = session.outputNames;
       const modelId = `onnx_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -3417,6 +3763,7 @@ var ONNXRuntime = class {
     }
     const { session, inputNames, outputNames } = sessionData;
     try {
+      const ortModule = await getOrt();
       const feeds = {};
       for (let i = 0; i < Math.min(inputs.length, inputNames.length); i++) {
         const inputName = inputNames[i];
@@ -3426,13 +3773,13 @@ var ONNXRuntime = class {
           let ortTensor;
           if (dtype === "int64") {
             const data = inputTensor.data;
-            ortTensor = new ort.Tensor("int64", data, inputTensor.shape);
+            ortTensor = new ortModule.Tensor("int64", data, inputTensor.shape);
           } else if (dtype === "int32") {
             const data = inputTensor.data;
-            ortTensor = new ort.Tensor("int32", data, inputTensor.shape);
+            ortTensor = new ortModule.Tensor("int32", data, inputTensor.shape);
           } else {
             const data = inputTensor.toFloat32Array();
-            ortTensor = new ort.Tensor("float32", data, inputTensor.shape);
+            ortTensor = new ortModule.Tensor("float32", data, inputTensor.shape);
           }
           feeds[inputName] = ortTensor;
         }
@@ -3462,25 +3809,23 @@ var ONNXRuntime = class {
     }
     const { session, inputNames, outputNames } = sessionData;
     try {
+      const ortModule = await getOrt();
       const feeds = {};
-      console.log("[ONNX] Model expects inputs:", inputNames);
-      console.log("[ONNX] Provided inputs:", Array.from(namedInputs.keys()));
       for (const [inputName, inputTensor] of namedInputs) {
         const tensor2 = inputTensor;
         const dtype = tensor2.dtype;
         let ortTensor;
         if (dtype === "int64") {
           const data = tensor2.data;
-          ortTensor = new ort.Tensor("int64", data, tensor2.shape);
+          ortTensor = new ortModule.Tensor("int64", data, tensor2.shape);
         } else if (dtype === "int32") {
           const data = tensor2.data;
-          ortTensor = new ort.Tensor("int32", data, tensor2.shape);
+          ortTensor = new ortModule.Tensor("int32", data, tensor2.shape);
         } else {
           const data = tensor2.toFloat32Array();
-          ortTensor = new ort.Tensor("float32", data, tensor2.shape);
+          ortTensor = new ortModule.Tensor("float32", data, tensor2.shape);
         }
         feeds[inputName] = ortTensor;
-        console.log(`[ONNX] Input '${inputName}': shape=${tensor2.shape}, dtype=${dtype}`);
       }
       const results = await session.run(feeds);
       const outputs = [];
@@ -3494,9 +3839,7 @@ var ONNXRuntime = class {
       }
       return outputs;
     } catch (error) {
-      console.error("[ONNX] Inference failed. Model expects:", inputNames);
-      console.error("[ONNX] Provided:", Array.from(namedInputs.keys()));
-      throw new EdgeFlowError(`ONNX inference failed: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INFERENCE_FAILED, { modelId: model.id, error });
+      throw new EdgeFlowError(`ONNX inference failed: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INFERENCE_FAILED, { modelId: model.id, expectedInputs: inputNames, providedInputs: Array.from(namedInputs.keys()), error });
     }
   }
   /**
@@ -3520,10 +3863,122 @@ function createONNXRuntime() {
   return new ONNXRuntime();
 }
 
+// dist/backends/transformers-adapter.js
+init_types();
+init_tensor();
+var sessionStore2 = /* @__PURE__ */ new Map();
+var adapterOptions = null;
+var TransformersAdapterRuntime = class {
+  constructor() {
+    __publicField(this, "name", "wasm");
+  }
+  // registers under the wasm slot
+  get capabilities() {
+    return {
+      concurrency: true,
+      quantization: true,
+      float16: true,
+      dynamicShapes: true,
+      maxBatchSize: 128,
+      availableMemory: 1024 * 1024 * 1024
+    };
+  }
+  async isAvailable() {
+    return adapterOptions?.pipelineFactory != null;
+  }
+  async initialize() {
+    if (!adapterOptions?.pipelineFactory) {
+      throw new EdgeFlowError("TransformersAdapterRuntime requires a pipelineFactory. Call useTransformersBackend({ pipelineFactory }) first.", ErrorCodes.RUNTIME_INIT_FAILED);
+    }
+  }
+  async loadModel(modelData, options = {}) {
+    const modelName = options.metadata?.name ?? "default";
+    const metadata = {
+      name: modelName,
+      version: "1.0.0",
+      inputs: [{ name: "input", dtype: "float32", shape: [-1] }],
+      outputs: [{ name: "output", dtype: "float32", shape: [-1] }],
+      sizeBytes: modelData.byteLength || 0,
+      quantization: options.quantization ?? "float32",
+      format: "onnx"
+    };
+    const modelId = `tjs_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const model = new LoadedModelImpl(metadata, this.name, () => {
+      const session = sessionStore2.get(modelId);
+      if (session?.instance.dispose) {
+        session.instance.dispose();
+      }
+      sessionStore2.delete(modelId);
+    });
+    getMemoryManager().trackModel(model, () => model.dispose());
+    return model;
+  }
+  /**
+   * Load a transformers.js pipeline by task + model name
+   * (called by the higher-level adapter pipeline, not via the
+   * standard loadModel path).
+   */
+  async loadPipeline(task, model, pipelineOptions) {
+    if (!adapterOptions?.pipelineFactory) {
+      throw new EdgeFlowError("Adapter not initialised", ErrorCodes.RUNTIME_NOT_INITIALIZED);
+    }
+    const opts = { ...pipelineOptions };
+    if (adapterOptions.device)
+      opts["device"] = adapterOptions.device;
+    if (adapterOptions.dtype)
+      opts["dtype"] = adapterOptions.dtype;
+    const instance = await adapterOptions.pipelineFactory(task, model, opts);
+    const modelId = `tjs_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    sessionStore2.set(modelId, { instance, task, model });
+    return modelId;
+  }
+  /**
+   * Run inference by passing the raw input to the transformers.js pipeline.
+   * The result is returned as a single EdgeFlowTensor wrapping the JSON-encoded output
+   * (since transformers.js returns task-specific objects, not raw tensors).
+   */
+  async run(model, inputs) {
+    const session = sessionStore2.get(model.id);
+    if (!session) {
+      throw new EdgeFlowError(`No transformers.js session for model ${model.id}`, ErrorCodes.MODEL_NOT_LOADED);
+    }
+    const inputData = inputs[0]?.toFloat32Array() ?? new Float32Array(0);
+    const result = await session.instance(inputData);
+    const resultArray = Array.isArray(result) ? new Float32Array(result.flat(Infinity)) : new Float32Array([0]);
+    return [new EdgeFlowTensor(resultArray, [resultArray.length], "float32")];
+  }
+  /**
+   * High-level: run the transformers.js pipeline directly with arbitrary input.
+   * Returns the raw result object (not a tensor).
+   */
+  async runDirect(modelId, input, options) {
+    const session = sessionStore2.get(modelId);
+    if (!session) {
+      throw new EdgeFlowError(`No transformers.js session for model ${modelId}`, ErrorCodes.MODEL_NOT_LOADED);
+    }
+    return session.instance(input, options);
+  }
+  dispose() {
+    for (const [id, session] of sessionStore2) {
+      if (session.instance.dispose) {
+        session.instance.dispose();
+      }
+      sessionStore2.delete(id);
+    }
+  }
+};
+var adapterRuntime = null;
+function useTransformersBackend(options) {
+  adapterOptions = options;
+  adapterRuntime = new TransformersAdapterRuntime();
+  registerRuntime("wasm", () => adapterRuntime);
+}
+function getTransformersAdapter() {
+  return adapterRuntime;
+}
+
 // dist/backends/index.js
 function registerAllBackends() {
-  registerRuntime("webgpu", createWebGPURuntime);
-  registerRuntime("webnn", createWebNNRuntime);
   registerRuntime("wasm", createONNXRuntime);
 }
 registerAllBackends();
@@ -3932,11 +4387,20 @@ var BasePipeline = class {
     this.downloadCache = new ModelDownloadCache();
   }
   /**
-   * Initialize the pipeline (load model)
+   * Initialize the pipeline (load model).
+   *
+   * Skips model loading when `config.model === 'default'` — concrete
+   * subclasses that define their own DEFAULT_MODELS handle all model
+   * loading in their overridden `initialize()` methods, so the base
+   * should not attempt to fetch a URL called "default".
    */
   async initialize() {
     if (this.isReady && this.model)
       return;
+    if (this.config.model === "default") {
+      this.isReady = true;
+      return;
+    }
     const cachedModel = this.modelCache.get(this.config.model);
     if (cachedModel) {
       this.model = cachedModel;
@@ -4111,9 +4575,19 @@ var Tokenizer = class _Tokenizer {
     if (data.model) {
       tokenizer.modelType = data.model.type;
       if (data.model.vocab) {
-        for (const [token, id] of Object.entries(data.model.vocab)) {
-          tokenizer.vocab.set(token, id);
-          tokenizer.reverseVocab.set(id, token);
+        if (Array.isArray(data.model.vocab)) {
+          const unigramVocab = data.model.vocab;
+          for (let i = 0; i < unigramVocab.length; i++) {
+            const entry = unigramVocab[i];
+            const token = Array.isArray(entry) ? entry[0] : entry;
+            tokenizer.vocab.set(token, i);
+            tokenizer.reverseVocab.set(i, token);
+          }
+        } else {
+          for (const [token, id] of Object.entries(data.model.vocab)) {
+            tokenizer.vocab.set(token, id);
+            tokenizer.reverseVocab.set(id, token);
+          }
         }
       }
       if (data.model.merges) {
@@ -4327,9 +4801,41 @@ var Tokenizer = class _Tokenizer {
       }
       case "WordPiece":
         return this.wordPiece(word);
+      case "Unigram":
+        return this.unigramTokenize(word);
       default:
         return this.vocab.has(word) ? [word] : [this.unkToken];
     }
+  }
+  /**
+   * Greedy longest-match tokenizer for SentencePiece Unigram models.
+   * Adds the U+2581 (▁) word-start prefix expected by SPM-based models.
+   */
+  unigramTokenize(word) {
+    const prefixedWord = "\u2581" + word;
+    const tokens = [];
+    let start = 0;
+    const text = prefixedWord;
+    while (start < text.length) {
+      let end = text.length;
+      let found = false;
+      while (end > start) {
+        const sub2 = text.slice(start, end);
+        if (this.vocab.has(sub2)) {
+          tokens.push(sub2);
+          start = end;
+          found = true;
+          break;
+        }
+        end--;
+      }
+      if (!found) {
+        const ch = text[start];
+        tokens.push(this.vocab.has(ch) ? ch : this.unkToken);
+        start++;
+      }
+    }
+    return tokens.length > 0 ? tokens : [this.unkToken];
   }
   /**
    * Main tokenization
@@ -4589,31 +5095,37 @@ async function loadTokenizerFromHub(modelId, options) {
 }
 
 // dist/pipelines/text-classification.js
+init_model_loader();
+var DEFAULT_MODELS = {
+  model: "https://huggingface.co/Xenova/distilbert-base-uncased-finetuned-sst-2-english/resolve/main/onnx/model_quantized.onnx",
+  tokenizer: "https://huggingface.co/Xenova/distilbert-base-uncased-finetuned-sst-2-english/resolve/main/tokenizer.json"
+};
+var DEFAULT_SST2_LABELS = ["NEGATIVE", "POSITIVE"];
 var TextClassificationPipeline = class extends BasePipeline {
   constructor(config, labels) {
     super(config);
     __publicField(this, "tokenizer", null);
+    __publicField(this, "onnxModel", null);
     __publicField(this, "labels");
-    this.labels = labels ?? SENTIMENT_LABELS;
+    __publicField(this, "modelUrl");
+    __publicField(this, "tokenizerUrl");
+    this.labels = labels ?? DEFAULT_SST2_LABELS;
+    this.modelUrl = config.model !== "default" ? config.model : DEFAULT_MODELS.model;
+    this.tokenizerUrl = DEFAULT_MODELS.tokenizer;
   }
-  /**
-   * Initialize pipeline
-   */
   async initialize() {
     await super.initialize();
     if (!this.tokenizer) {
-      this.tokenizer = createBasicTokenizer();
+      this.tokenizer = await Tokenizer.fromUrl(this.tokenizerUrl);
+    }
+    if (!this.onnxModel) {
+      const modelData = await loadModelData(this.modelUrl, { cache: this.config.cache ?? true });
+      this.onnxModel = await loadModelFromBuffer(modelData);
     }
   }
-  /**
-   * Set custom labels
-   */
   setLabels(labels) {
     this.labels = labels;
   }
-  /**
-   * Run classification
-   */
   async run(input, options) {
     const isBatch = Array.isArray(input);
     const inputs = isBatch ? input : [input];
@@ -4632,9 +5144,6 @@ var TextClassificationPipeline = class extends BasePipeline {
     }
     return isBatch ? results : results[0];
   }
-  /**
-   * Preprocess text input
-   */
   async preprocess(input) {
     const text = Array.isArray(input) ? input[0] : input;
     const encoded = this.tokenizer.encode(text, {
@@ -4642,26 +5151,17 @@ var TextClassificationPipeline = class extends BasePipeline {
       padding: "max_length",
       truncation: true
     });
-    const inputIds = new EdgeFlowTensor(new Float32Array(encoded.inputIds), [1, encoded.inputIds.length], "float32");
-    const attentionMask = new EdgeFlowTensor(new Float32Array(encoded.attentionMask), [1, encoded.attentionMask.length], "float32");
+    const inputIds = new EdgeFlowTensor(BigInt64Array.from(encoded.inputIds.map((id) => BigInt(id))), [1, encoded.inputIds.length], "int64");
+    const attentionMask = new EdgeFlowTensor(BigInt64Array.from(encoded.attentionMask.map((m) => BigInt(m))), [1, encoded.attentionMask.length], "int64");
     return [inputIds, attentionMask];
   }
-  /**
-   * Run model inference
-   */
   async runInference(inputs) {
-    const numClasses = this.labels.length;
-    const logits = new Float32Array(numClasses);
-    const inputData = inputs[0]?.toFloat32Array() ?? new Float32Array(0);
-    const sum2 = inputData.reduce((a, b) => a + b, 0);
-    for (let i = 0; i < numClasses; i++) {
-      logits[i] = Math.sin(sum2 * (i + 1)) * 2;
-    }
-    return [new EdgeFlowTensor(logits, [1, numClasses], "float32")];
+    const namedInputs = /* @__PURE__ */ new Map();
+    namedInputs.set("input_ids", inputs[0]);
+    namedInputs.set("attention_mask", inputs[1]);
+    const outputs = await runInferenceNamed(this.onnxModel, namedInputs);
+    return outputs;
   }
-  /**
-   * Postprocess model outputs
-   */
   async postprocess(outputs, options) {
     const logits = outputs[0];
     if (!logits) {
@@ -4669,10 +5169,6 @@ var TextClassificationPipeline = class extends BasePipeline {
     }
     const probs = softmax(logits, -1);
     const probsArray = probs.toFloat32Array();
-    const topK = options?.topK ?? 1;
-    const returnAllScores = options?.returnAllScores ?? false;
-    if (returnAllScores || topK > 1) {
-    }
     let maxIdx = 0;
     let maxScore = probsArray[0] ?? 0;
     for (let i = 1; i < probsArray.length; i++) {
@@ -4692,9 +5188,6 @@ var SentimentAnalysisPipeline = class extends TextClassificationPipeline {
   constructor(config) {
     super(config, SENTIMENT_LABELS);
   }
-  /**
-   * Analyze sentiment
-   */
   async analyze(text, options) {
     return this.run(text, options);
   }
@@ -4722,25 +5215,34 @@ registerPipeline("sentiment-analysis", (config) => new SentimentAnalysisPipeline
 
 // dist/pipelines/feature-extraction.js
 init_tensor();
+init_model_loader();
+var DEFAULT_MODELS2 = {
+  model: "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx",
+  tokenizer: "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+};
+var DEFAULT_EMBEDDING_DIM = 384;
 var FeatureExtractionPipeline = class extends BasePipeline {
-  constructor(config, embeddingDim = 768) {
+  constructor(config, embeddingDim = DEFAULT_EMBEDDING_DIM) {
     super(config);
     __publicField(this, "tokenizer", null);
+    __publicField(this, "onnxModel", null);
     __publicField(this, "embeddingDim");
+    __publicField(this, "modelUrl");
+    __publicField(this, "tokenizerUrl");
     this.embeddingDim = embeddingDim;
+    this.modelUrl = config.model !== "default" ? config.model : DEFAULT_MODELS2.model;
+    this.tokenizerUrl = DEFAULT_MODELS2.tokenizer;
   }
-  /**
-   * Initialize pipeline
-   */
   async initialize() {
     await super.initialize();
     if (!this.tokenizer) {
-      this.tokenizer = createBasicTokenizer();
+      this.tokenizer = await Tokenizer.fromUrl(this.tokenizerUrl);
+    }
+    if (!this.onnxModel) {
+      const modelData = await loadModelData(this.modelUrl, { cache: this.config.cache ?? true });
+      this.onnxModel = await loadModelFromBuffer(modelData);
     }
   }
-  /**
-   * Run feature extraction
-   */
   async run(input, options) {
     const isBatch = Array.isArray(input);
     const inputs = isBatch ? input : [input];
@@ -4759,9 +5261,6 @@ var FeatureExtractionPipeline = class extends BasePipeline {
     }
     return isBatch ? results : results[0];
   }
-  /**
-   * Preprocess text input
-   */
   async preprocess(input) {
     const text = Array.isArray(input) ? input[0] : input;
     const encoded = this.tokenizer.encode(text, {
@@ -4769,28 +5268,19 @@ var FeatureExtractionPipeline = class extends BasePipeline {
       padding: "max_length",
       truncation: true
     });
-    const inputIds = new EdgeFlowTensor(new Float32Array(encoded.inputIds), [1, encoded.inputIds.length], "float32");
-    const attentionMask = new EdgeFlowTensor(new Float32Array(encoded.attentionMask), [1, encoded.attentionMask.length], "float32");
-    return [inputIds, attentionMask];
+    const inputIds = new EdgeFlowTensor(BigInt64Array.from(encoded.inputIds.map((id) => BigInt(id))), [1, encoded.inputIds.length], "int64");
+    const attentionMask = new EdgeFlowTensor(BigInt64Array.from(encoded.attentionMask.map((m) => BigInt(m))), [1, encoded.attentionMask.length], "int64");
+    const tokenTypeIds = new EdgeFlowTensor(BigInt64Array.from(encoded.inputIds.map(() => BigInt(0))), [1, encoded.inputIds.length], "int64");
+    return [inputIds, attentionMask, tokenTypeIds];
   }
-  /**
-   * Run model inference
-   */
   async runInference(inputs) {
-    const seqLen = inputs[0]?.shape[1] ?? 128;
-    const embeddings = new Float32Array(seqLen * this.embeddingDim);
-    const inputData = inputs[0]?.toFloat32Array() ?? new Float32Array(0);
-    for (let i = 0; i < seqLen; i++) {
-      for (let j = 0; j < this.embeddingDim; j++) {
-        const inputVal = inputData[i] ?? 0;
-        embeddings[i * this.embeddingDim + j] = Math.sin(inputVal * (j + 1) * 0.01) * 0.1;
-      }
-    }
-    return [new EdgeFlowTensor(embeddings, [1, seqLen, this.embeddingDim], "float32")];
+    const namedInputs = /* @__PURE__ */ new Map();
+    namedInputs.set("input_ids", inputs[0]);
+    namedInputs.set("attention_mask", inputs[1]);
+    namedInputs.set("token_type_ids", inputs[2]);
+    const outputs = await runInferenceNamed(this.onnxModel, namedInputs);
+    return outputs;
   }
-  /**
-   * Postprocess model outputs
-   */
   async postprocess(outputs, options) {
     const hiddenStates = outputs[0];
     if (!hiddenStates) {
@@ -4822,17 +5312,11 @@ var FeatureExtractionPipeline = class extends BasePipeline {
     }
     return { embeddings };
   }
-  /**
-   * Extract CLS token embedding
-   */
   extractCLSEmbedding(hiddenStates) {
     const data = hiddenStates.toFloat32Array();
     const embeddingDim = hiddenStates.shape[2] ?? this.embeddingDim;
     return Array.from(data.slice(0, embeddingDim));
   }
-  /**
-   * Mean pooling over sequence
-   */
   meanPooling(hiddenStates) {
     const data = hiddenStates.toFloat32Array();
     const seqLen = hiddenStates.shape[1] ?? 1;
@@ -4845,9 +5329,6 @@ var FeatureExtractionPipeline = class extends BasePipeline {
     }
     return Array.from(result);
   }
-  /**
-   * Max pooling over sequence
-   */
   maxPooling(hiddenStates) {
     const data = hiddenStates.toFloat32Array();
     const seqLen = hiddenStates.shape[1] ?? 1;
@@ -4863,9 +5344,6 @@ var FeatureExtractionPipeline = class extends BasePipeline {
     }
     return result;
   }
-  /**
-   * L2 normalize vector
-   */
   normalizeVector(vec) {
     let norm = 0;
     for (const v of vec) {
@@ -5479,34 +5957,33 @@ function createAudioPreprocessor(preset = "whisper", options = {}) {
 }
 
 // dist/pipelines/image-classification.js
+init_model_loader();
+var DEFAULT_MODELS3 = {
+  model: "https://huggingface.co/Xenova/mobilevit-small/resolve/main/onnx/model_quantized.onnx"
+};
 var ImageClassificationPipeline = class extends BasePipeline {
-  constructor(config, labels, numClasses = 1e3) {
+  constructor(config, labels, _numClasses = 1e3) {
     super(config);
     __publicField(this, "preprocessor", null);
+    __publicField(this, "onnxModel", null);
     __publicField(this, "labels");
-    __publicField(this, "numClasses");
+    __publicField(this, "modelUrl");
     this.labels = labels ?? IMAGENET_LABELS;
-    this.numClasses = numClasses;
+    this.modelUrl = config.model !== "default" ? config.model : DEFAULT_MODELS3.model;
   }
-  /**
-   * Initialize pipeline
-   */
   async initialize() {
     await super.initialize();
     if (!this.preprocessor) {
       this.preprocessor = createImagePreprocessor("imagenet");
     }
+    if (!this.onnxModel) {
+      const modelData = await loadModelData(this.modelUrl, { cache: this.config.cache ?? true });
+      this.onnxModel = await loadModelFromBuffer(modelData);
+    }
   }
-  /**
-   * Set custom labels
-   */
   setLabels(labels) {
     this.labels = labels;
-    this.numClasses = labels.length;
   }
-  /**
-   * Run classification
-   */
   async run(input, options) {
     const isBatch = Array.isArray(input);
     const inputs = isBatch ? input : [input];
@@ -5515,7 +5992,7 @@ var ImageClassificationPipeline = class extends BasePipeline {
     const results = [];
     for (const image of inputs) {
       const tensorInputs = await this.preprocess(image);
-      const outputs = await this.runInference(tensorInputs);
+      const outputs = await this.runModelInference(tensorInputs);
       const result = await this.postprocess(outputs, options);
       results.push(result);
     }
@@ -5525,9 +6002,6 @@ var ImageClassificationPipeline = class extends BasePipeline {
     }
     return isBatch ? results : results[0];
   }
-  /**
-   * Preprocess image input
-   */
   async preprocess(input) {
     const image = Array.isArray(input) ? input[0] : input;
     const tensor2 = await this.preprocessor.process(image);
@@ -5536,24 +6010,10 @@ var ImageClassificationPipeline = class extends BasePipeline {
     }
     return [tensor2];
   }
-  /**
-   * Run model inference
-   */
-  async runInference(inputs) {
-    const logits = new Float32Array(this.numClasses);
-    const inputData = inputs[0]?.toFloat32Array() ?? new Float32Array(0);
-    let sum2 = 0;
-    for (let i = 0; i < Math.min(1e3, inputData.length); i++) {
-      sum2 += inputData[i] ?? 0;
-    }
-    for (let i = 0; i < this.numClasses; i++) {
-      logits[i] = Math.sin(sum2 * (i + 1) * 0.1) * 3;
-    }
-    return [new EdgeFlowTensor(logits, [1, this.numClasses], "float32")];
+  async runModelInference(inputs) {
+    const outputs = await runInference(this.onnxModel, inputs);
+    return outputs;
   }
-  /**
-   * Postprocess model outputs
-   */
   async postprocess(outputs, options) {
     const logits = outputs[0];
     if (!logits) {
@@ -5561,9 +6021,6 @@ var ImageClassificationPipeline = class extends BasePipeline {
     }
     const probs = softmax(logits, -1);
     const probsArray = probs.toFloat32Array();
-    const topK = options?.topK ?? 1;
-    if (topK > 1 || options?.returnAllScores) {
-    }
     let maxIdx = 0;
     let maxScore = probsArray[0] ?? 0;
     for (let i = 1; i < probsArray.length; i++) {
@@ -5573,10 +6030,7 @@ var ImageClassificationPipeline = class extends BasePipeline {
       }
     }
     const label = options?.labels?.[maxIdx] ?? this.labels[maxIdx] ?? `class_${maxIdx}`;
-    return {
-      label,
-      score: maxScore
-    };
+    return { label, score: maxScore };
   }
 };
 function createImageClassificationPipeline(config = {}, labels) {
@@ -6268,6 +6722,10 @@ function createTextGenerationPipeline(config) {
 
 // dist/pipelines/object-detection.js
 init_tensor();
+init_model_loader();
+var DEFAULT_MODELS4 = {
+  model: "https://huggingface.co/Xenova/yolos-tiny/resolve/main/onnx/model_quantized.onnx"
+};
 var COCO_LABELS = [
   "person",
   "bicycle",
@@ -6357,8 +6815,11 @@ var ObjectDetectionPipeline = class extends BasePipeline {
       model: "default"
     });
     __publicField(this, "preprocessor");
+    __publicField(this, "onnxModel", null);
     __publicField(this, "labels");
+    __publicField(this, "modelUrl");
     this.labels = labels ?? COCO_LABELS;
+    this.modelUrl = config?.model && config.model !== "default" ? config.model : DEFAULT_MODELS4.model;
     this.preprocessor = new ImagePreprocessor({
       width: 640,
       height: 640,
@@ -6367,15 +6828,22 @@ var ObjectDetectionPipeline = class extends BasePipeline {
       channelFormat: "CHW"
     });
   }
-  /**
-   * Set custom labels
-   */
+  async initialize() {
+    await super.initialize();
+    if (!this.onnxModel) {
+      const modelData = await loadModelData(this.modelUrl, { cache: this.config.cache ?? true });
+      this.onnxModel = await loadModelFromBuffer(modelData);
+    }
+  }
   setLabels(labels) {
     this.labels = labels;
   }
-  /**
-   * Preprocess image for detection
-   */
+  async run(input, options) {
+    await this.initialize();
+    const tensorInputs = await this.preprocess(input);
+    const outputs = await this.runModelInference(tensorInputs);
+    return this.postprocess(outputs, options);
+  }
   async preprocess(input) {
     const inputs = Array.isArray(input) ? input : [input];
     if (inputs.length === 1) {
@@ -6384,9 +6852,10 @@ var ObjectDetectionPipeline = class extends BasePipeline {
     }
     return [await this.preprocessor.processBatch(inputs)];
   }
-  /**
-   * Postprocess detection outputs
-   */
+  async runModelInference(inputs) {
+    const outputs = await runInference(this.onnxModel, inputs);
+    return outputs;
+  }
   async postprocess(outputs, options) {
     const opts = options ?? {};
     const threshold = opts.threshold ?? 0.5;
@@ -6404,9 +6873,6 @@ var ObjectDetectionPipeline = class extends BasePipeline {
     filtered = filtered.slice(0, topK);
     return filtered;
   }
-  /**
-   * Parse raw model output into detections
-   */
   parseDetections(data, shape, threshold) {
     const detections = [];
     const numBoxes = shape[1] ?? 0;
@@ -6480,9 +6946,6 @@ var ObjectDetectionPipeline = class extends BasePipeline {
     }
     return detections;
   }
-  /**
-   * Non-maximum suppression
-   */
   nonMaxSuppression(detections, iouThreshold) {
     if (detections.length === 0)
       return [];
@@ -6508,9 +6971,6 @@ var ObjectDetectionPipeline = class extends BasePipeline {
     }
     return selected;
   }
-  /**
-   * Compute Intersection over Union
-   */
   computeIoU(a, b) {
     const xOverlap = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
     const yOverlap = Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
@@ -6521,9 +6981,23 @@ var ObjectDetectionPipeline = class extends BasePipeline {
     return union > 0 ? intersection / union : 0;
   }
 };
+registerPipeline("object-detection", (config) => new ObjectDetectionPipeline(config));
 
 // dist/pipelines/automatic-speech-recognition.js
 init_tensor();
+init_model_loader();
+var DEFAULT_MODELS5 = {
+  encoder: "https://huggingface.co/Xenova/whisper-tiny/resolve/main/onnx/encoder_model_quantized.onnx",
+  decoder: "https://huggingface.co/Xenova/whisper-tiny/resolve/main/onnx/decoder_model_merged_quantized.onnx",
+  tokenizer: "https://huggingface.co/Xenova/whisper-tiny/resolve/main/tokenizer.json"
+};
+var SOT_TOKEN = 50258;
+var TRANSLATE_TOKEN = 50358;
+var TRANSCRIBE_TOKEN = 50359;
+var EOT_TOKEN = 50257;
+var NO_TIMESTAMPS_TOKEN = 50363;
+var EN_TOKEN = 50259;
+var MAX_DECODER_TOKENS = 448;
 var AutomaticSpeechRecognitionPipeline = class extends BasePipeline {
   constructor(config) {
     super(config ?? {
@@ -6532,6 +7006,14 @@ var AutomaticSpeechRecognitionPipeline = class extends BasePipeline {
     });
     __publicField(this, "audioPreprocessor");
     __publicField(this, "tokenizer", null);
+    __publicField(this, "encoderModel", null);
+    __publicField(this, "decoderModel", null);
+    __publicField(this, "encoderUrl");
+    __publicField(this, "decoderUrl");
+    __publicField(this, "tokenizerUrl");
+    this.encoderUrl = DEFAULT_MODELS5.encoder;
+    this.decoderUrl = DEFAULT_MODELS5.decoder;
+    this.tokenizerUrl = DEFAULT_MODELS5.tokenizer;
     this.audioPreprocessor = new AudioPreprocessor({
       sampleRate: 16e3,
       nMels: 80,
@@ -6540,76 +7022,116 @@ var AutomaticSpeechRecognitionPipeline = class extends BasePipeline {
       maxDuration: 30
     });
   }
-  /**
-   * Set tokenizer for decoding
-   */
+  async initialize() {
+    await super.initialize();
+    if (!this.tokenizer) {
+      this.tokenizer = await Tokenizer.fromUrl(this.tokenizerUrl);
+    }
+    if (!this.encoderModel) {
+      const data = await loadModelData(this.encoderUrl, { cache: this.config.cache ?? true });
+      this.encoderModel = await loadModelFromBuffer(data);
+    }
+    if (!this.decoderModel) {
+      const data = await loadModelData(this.decoderUrl, { cache: this.config.cache ?? true });
+      this.decoderModel = await loadModelFromBuffer(data);
+    }
+  }
   setTokenizer(tokenizer) {
     this.tokenizer = tokenizer;
   }
-  /**
-   * Preprocess audio input
-   */
-  async preprocess(input) {
-    const inputs = Array.isArray(input) ? input : [input];
-    const tensors = await Promise.all(inputs.map((audio) => this.audioPreprocessor.process(audio)));
-    if (tensors.length === 1) {
-      const t = tensors[0];
-      return [new EdgeFlowTensor(t.toFloat32Array(), [1, ...t.shape], "float32")];
-    }
-    return tensors;
-  }
-  /**
-   * Postprocess model output
-   */
-  async postprocess(outputs, options) {
+  async run(input, options) {
+    await this.initialize();
+    const isBatch = Array.isArray(input);
+    const inputs = isBatch ? input : [input];
     const opts = options ?? {};
-    const returnTimestamps = opts.returnTimestamps ?? false;
-    if (!outputs[0]) {
-      return { text: "" };
+    const results = [];
+    for (const audio of inputs) {
+      const result = await this.transcribeSingle(audio, opts);
+      results.push(result);
     }
-    const outputData = outputs[0].toFloat32Array();
-    const shape = outputs[0].shape;
-    const text = this.decodeOutput(outputData, shape);
-    const result = { text };
-    if (returnTimestamps) {
-      result.chunks = this.extractTimestamps(outputData, shape, text);
+    return isBatch ? results : results[0];
+  }
+  async transcribeSingle(audio, options) {
+    const startTime = performance.now();
+    const melTensor = await this.audioPreprocessor.process(audio);
+    const melInput = new EdgeFlowTensor(melTensor.toFloat32Array(), [1, ...melTensor.shape], "float32");
+    const encoderOutputs = await runInference(this.encoderModel, [melInput]);
+    const encoderHidden = encoderOutputs[0];
+    const task = options.task ?? "transcribe";
+    const initialTokens = this.buildInitialTokens(task, options.language);
+    const generatedTokens = await this.autoregressiveDecode(encoderHidden, initialTokens);
+    const text = this.tokenizer.decode(generatedTokens, true);
+    const result = {
+      text: text.trim(),
+      processingTime: performance.now() - startTime
+    };
+    if (options.returnTimestamps) {
+      result.chunks = this.extractTimestamps(generatedTokens, text);
     }
     return result;
   }
-  /**
-   * Decode model output to text
-   */
-  decodeOutput(data, shape) {
-    const seqLen = shape[1] ?? data.length;
-    const vocabSize = shape[2] ?? 1;
-    const tokenIds = [];
-    if (vocabSize > 1) {
-      for (let i = 0; i < seqLen; i++) {
-        const offset = i * vocabSize;
-        let maxIdx = 0;
-        let maxVal = data[offset] ?? -Infinity;
-        for (let j = 1; j < vocabSize; j++) {
-          if ((data[offset + j] ?? -Infinity) > maxVal) {
-            maxVal = data[offset + j] ?? -Infinity;
-            maxIdx = j;
-          }
-        }
-        tokenIds.push(maxIdx);
-      }
-    } else {
-      for (let i = 0; i < data.length; i++) {
-        tokenIds.push(Math.round(data[i] ?? 0));
-      }
-    }
-    if (this.tokenizer) {
-      return this.tokenizer.decode(tokenIds, true);
-    }
-    return tokenIds.join(" ");
+  buildInitialTokens(task, language) {
+    const tokens = [SOT_TOKEN];
+    tokens.push(language ? this.getLanguageToken(language) : EN_TOKEN);
+    tokens.push(task === "translate" ? TRANSLATE_TOKEN : TRANSCRIBE_TOKEN);
+    tokens.push(NO_TIMESTAMPS_TOKEN);
+    return tokens;
+  }
+  getLanguageToken(language) {
+    const langMap = {
+      en: 50259,
+      zh: 50260,
+      de: 50261,
+      es: 50262,
+      ru: 50263,
+      ko: 50264,
+      fr: 50265,
+      ja: 50266,
+      pt: 50267,
+      tr: 50268,
+      pl: 50269,
+      ca: 50270,
+      nl: 50271,
+      ar: 50272,
+      sv: 50273,
+      it: 50274,
+      id: 50275,
+      hi: 50276,
+      fi: 50277,
+      vi: 50278
+    };
+    return langMap[language.toLowerCase()] ?? EN_TOKEN;
   }
   /**
-   * Extract timestamps from output
+   * Autoregressive decoder loop similar to text-generation.
+   * Feeds encoder hidden states + growing token sequence to decoder.
    */
-  extractTimestamps(_data, _shape, text) {
+  async autoregressiveDecode(encoderHidden, initialTokens) {
+    const tokens = [...initialTokens];
+    for (let step = 0; step < MAX_DECODER_TOKENS; step++) {
+      const decoderInputIds = new EdgeFlowTensor(BigInt64Array.from(tokens.map((t) => BigInt(t))), [1, tokens.length], "int64");
+      const namedInputs = /* @__PURE__ */ new Map();
+      namedInputs.set("input_ids", decoderInputIds);
+      namedInputs.set("encoder_hidden_states", encoderHidden);
+      const decoderOutputs = await runInferenceNamed(this.decoderModel, namedInputs);
+      const logits = decoderOutputs[0].toFloat32Array();
+      const vocabSize = logits.length / tokens.length;
+      const lastTokenLogits = logits.slice((tokens.length - 1) * vocabSize);
+      let bestId = 0;
+      let bestVal = lastTokenLogits[0] ?? -Infinity;
+      for (let i = 1; i < lastTokenLogits.length; i++) {
+        if ((lastTokenLogits[i] ?? -Infinity) > bestVal) {
+          bestVal = lastTokenLogits[i] ?? -Infinity;
+          bestId = i;
+        }
+      }
+      if (bestId === EOT_TOKEN)
+        break;
+      tokens.push(bestId);
+    }
+    return tokens.slice(initialTokens.length);
+  }
+  extractTimestamps(_tokenIds, text) {
     const words = text.split(/\s+/).filter((w) => w.length > 0);
     const chunks = [];
     const wordsPerSecond = 2.5;
@@ -6630,9 +7152,6 @@ var AutomaticSpeechRecognitionPipeline = class extends BasePipeline {
     }
     return chunks;
   }
-  /**
-   * Process long audio in chunks
-   */
   async processLongAudio(audio, options = {}) {
     const chunkDuration = options.chunkDuration ?? 30;
     const chunkOverlap = options.chunkOverlap ?? 5;
@@ -6664,10 +7183,68 @@ var AutomaticSpeechRecognitionPipeline = class extends BasePipeline {
       chunks: mergedChunks
     };
   }
+  async preprocess(input) {
+    const inputs = Array.isArray(input) ? input : [input];
+    const tensors = await Promise.all(inputs.map((audio) => this.audioPreprocessor.process(audio)));
+    if (tensors.length === 1) {
+      const t = tensors[0];
+      return [new EdgeFlowTensor(t.toFloat32Array(), [1, ...t.shape], "float32")];
+    }
+    return tensors;
+  }
+  async postprocess(outputs, options) {
+    const opts = options ?? {};
+    const returnTimestamps = opts.returnTimestamps ?? false;
+    if (!outputs[0]) {
+      return { text: "" };
+    }
+    const outputData = outputs[0].toFloat32Array();
+    const shape = outputs[0].shape;
+    const text = this.decodeOutput(outputData, shape);
+    const result = { text };
+    if (returnTimestamps) {
+      result.chunks = this.extractTimestamps([], text);
+    }
+    return result;
+  }
+  decodeOutput(data, shape) {
+    const seqLen = shape[1] ?? data.length;
+    const vocabSize = shape[2] ?? 1;
+    const tokenIds = [];
+    if (vocabSize > 1) {
+      for (let i = 0; i < seqLen; i++) {
+        const offset = i * vocabSize;
+        let maxIdx = 0;
+        let maxVal = data[offset] ?? -Infinity;
+        for (let j = 1; j < vocabSize; j++) {
+          if ((data[offset + j] ?? -Infinity) > maxVal) {
+            maxVal = data[offset + j] ?? -Infinity;
+            maxIdx = j;
+          }
+        }
+        tokenIds.push(maxIdx);
+      }
+    } else {
+      for (let i = 0; i < data.length; i++) {
+        tokenIds.push(Math.round(data[i] ?? 0));
+      }
+    }
+    if (this.tokenizer) {
+      return this.tokenizer.decode(tokenIds, true);
+    }
+    return tokenIds.join(" ");
+  }
 };
+registerPipeline("automatic-speech-recognition", (config) => new AutomaticSpeechRecognitionPipeline(config));
 
 // dist/pipelines/zero-shot-classification.js
 init_tensor();
+init_model_loader();
+var DEFAULT_MODELS6 = {
+  model: "https://huggingface.co/Xenova/nli-deberta-v3-small/resolve/main/onnx/model_quantized.onnx",
+  tokenizer: "https://huggingface.co/Xenova/nli-deberta-v3-small/resolve/main/tokenizer.json"
+};
+var ENTAILMENT_IDX = 2;
 var ZeroShotClassificationPipeline = class extends BasePipeline {
   constructor(config) {
     super(config ?? {
@@ -6675,23 +7252,29 @@ var ZeroShotClassificationPipeline = class extends BasePipeline {
       model: "default"
     });
     __publicField(this, "tokenizer", null);
+    __publicField(this, "onnxModel", null);
     __publicField(this, "hypothesisTemplate", "This text is about {label}.");
+    __publicField(this, "modelUrl");
+    __publicField(this, "tokenizerUrl");
+    this.modelUrl = config?.model && config.model !== "default" ? config.model : DEFAULT_MODELS6.model;
+    this.tokenizerUrl = DEFAULT_MODELS6.tokenizer;
   }
-  /**
-   * Set tokenizer
-   */
+  async initialize() {
+    await super.initialize();
+    if (!this.tokenizer) {
+      this.tokenizer = await Tokenizer.fromUrl(this.tokenizerUrl);
+    }
+    if (!this.onnxModel) {
+      const modelData = await loadModelData(this.modelUrl, { cache: this.config.cache ?? true });
+      this.onnxModel = await loadModelFromBuffer(modelData);
+    }
+  }
   setTokenizer(tokenizer) {
     this.tokenizer = tokenizer;
   }
-  /**
-   * Run classification (convenience method with separate arguments)
-   */
   async classify(text, candidateLabels, options) {
     return this.run({ text, candidateLabels }, options);
   }
-  /**
-   * Run classification
-   */
   async run(input, options) {
     await this.initialize();
     const { text, candidateLabels } = input;
@@ -6702,9 +7285,6 @@ var ZeroShotClassificationPipeline = class extends BasePipeline {
     const results = await Promise.all(texts.map((t) => this.classifySingle(t, candidateLabels, template, multiLabel)));
     return Array.isArray(text) ? results : results[0];
   }
-  /**
-   * Classify a single text
-   */
   async classifySingle(text, candidateLabels, template, multiLabel) {
     const startTime = performance.now();
     const hypotheses = candidateLabels.map((label) => template.replace("{label}", label));
@@ -6733,32 +7313,30 @@ var ZeroShotClassificationPipeline = class extends BasePipeline {
     };
   }
   /**
-   * Score a single hypothesis using NLI
+   * Score a single hypothesis using the real NLI ONNX model.
+   * Returns the entailment logit.
    */
   async scoreHypothesis(premise, hypothesis) {
-    if (!this.tokenizer) {
-      throw new Error("Tokenizer not set. Call setTokenizer() first.");
-    }
-    this.tokenizer.encode(premise, {
+    const encoded = this.tokenizer.encode(premise, {
       textPair: hypothesis,
       addSpecialTokens: true,
       maxLength: 512,
       truncation: true,
-      returnAttentionMask: true,
-      returnTokenTypeIds: true
+      returnAttentionMask: true
     });
-    return Math.random();
+    const inputIds = new EdgeFlowTensor(BigInt64Array.from(encoded.inputIds.map((id) => BigInt(id))), [1, encoded.inputIds.length], "int64");
+    const attentionMask = new EdgeFlowTensor(BigInt64Array.from(encoded.attentionMask.map((m) => BigInt(m))), [1, encoded.attentionMask.length], "int64");
+    const namedInputs = /* @__PURE__ */ new Map();
+    namedInputs.set("input_ids", inputIds);
+    namedInputs.set("attention_mask", attentionMask);
+    const outputs = await runInferenceNamed(this.onnxModel, namedInputs);
+    const logits = outputs[0].toFloat32Array();
+    return logits[ENTAILMENT_IDX] ?? 0;
   }
-  /**
-   * Preprocess - not directly used (handled in scoreHypothesis)
-   */
   async preprocess(input) {
     const { text, candidateLabels } = input;
     const firstText = Array.isArray(text) ? text[0] ?? "" : text;
     const firstLabel = candidateLabels[0] ?? "";
-    if (!this.tokenizer) {
-      return [new EdgeFlowTensor(new Float32Array([0]), [1], "float32")];
-    }
     const encoded = this.tokenizer.encode(firstText, {
       textPair: this.hypothesisTemplate.replace("{label}", firstLabel),
       addSpecialTokens: true,
@@ -6766,9 +7344,6 @@ var ZeroShotClassificationPipeline = class extends BasePipeline {
     });
     return [new EdgeFlowTensor(BigInt64Array.from(encoded.inputIds.map((id) => BigInt(id))), [1, encoded.inputIds.length], "int64")];
   }
-  /**
-   * Postprocess - not directly used
-   */
   async postprocess(_outputs, _options) {
     return {
       sequence: "",
@@ -6777,9 +7352,15 @@ var ZeroShotClassificationPipeline = class extends BasePipeline {
     };
   }
 };
+registerPipeline("zero-shot-classification", (config) => new ZeroShotClassificationPipeline(config));
 
 // dist/pipelines/question-answering.js
 init_tensor();
+init_model_loader();
+var DEFAULT_MODELS7 = {
+  model: "https://huggingface.co/Xenova/distilbert-base-cased-distilled-squad/resolve/main/onnx/model_quantized.onnx",
+  tokenizer: "https://huggingface.co/Xenova/distilbert-base-cased-distilled-squad/resolve/main/tokenizer.json"
+};
 var QuestionAnsweringPipeline = class extends BasePipeline {
   constructor(config) {
     super(config ?? {
@@ -6787,32 +7368,35 @@ var QuestionAnsweringPipeline = class extends BasePipeline {
       model: "default"
     });
     __publicField(this, "tokenizer", null);
+    __publicField(this, "onnxModel", null);
+    __publicField(this, "modelUrl");
+    __publicField(this, "tokenizerUrl");
+    this.modelUrl = config?.model && config.model !== "default" ? config.model : DEFAULT_MODELS7.model;
+    this.tokenizerUrl = DEFAULT_MODELS7.tokenizer;
   }
-  /**
-   * Set tokenizer
-   */
+  async initialize() {
+    await super.initialize();
+    if (!this.tokenizer) {
+      this.tokenizer = await Tokenizer.fromUrl(this.tokenizerUrl);
+    }
+    if (!this.onnxModel) {
+      const modelData = await loadModelData(this.modelUrl, { cache: this.config.cache ?? true });
+      this.onnxModel = await loadModelFromBuffer(modelData);
+    }
+  }
   setTokenizer(tokenizer) {
     this.tokenizer = tokenizer;
   }
-  /**
-   * Run question answering
-   */
   async run(input, options) {
     await this.initialize();
     const inputs = Array.isArray(input) ? input : [input];
     const results = await Promise.all(inputs.map((i) => this.answerQuestion(i, options ?? {})));
     return Array.isArray(input) ? results : results[0];
   }
-  /**
-   * Answer a single question
-   */
   async answerQuestion(input, options) {
     const startTime = performance.now();
-    if (!this.tokenizer) {
-      throw new Error("Tokenizer not set. Call setTokenizer() first.");
-    }
     const { question, context } = input;
-    const { maxAnswerLength = 30 } = options;
+    const maxAnswerLength = options.maxAnswerLength ?? 30;
     const encoded = this.tokenizer.encode(question, {
       textPair: context,
       addSpecialTokens: true,
@@ -6821,57 +7405,51 @@ var QuestionAnsweringPipeline = class extends BasePipeline {
       returnAttentionMask: true,
       returnTokenTypeIds: true
     });
-    const answer = this.findBestAnswer(context, question, encoded.inputIds, maxAnswerLength);
+    const inputIds = new EdgeFlowTensor(BigInt64Array.from(encoded.inputIds.map((id) => BigInt(id))), [1, encoded.inputIds.length], "int64");
+    const attentionMask = new EdgeFlowTensor(BigInt64Array.from(encoded.attentionMask.map((m) => BigInt(m))), [1, encoded.attentionMask.length], "int64");
+    const namedInputs = /* @__PURE__ */ new Map();
+    namedInputs.set("input_ids", inputIds);
+    namedInputs.set("attention_mask", attentionMask);
+    const outputs = await runInferenceNamed(this.onnxModel, namedInputs);
+    if (outputs.length < 2) {
+      return { answer: "", score: 0, start: 0, end: 0, processingTime: performance.now() - startTime };
+    }
+    const startLogits = outputs[0].toFloat32Array();
+    const endLogits = outputs[1].toFloat32Array();
+    const seqLen = startLogits.length;
+    const startProbs = softmax(new EdgeFlowTensor(new Float32Array(startLogits), [seqLen], "float32")).toFloat32Array();
+    const endProbs = softmax(new EdgeFlowTensor(new Float32Array(endLogits), [seqLen], "float32")).toFloat32Array();
+    let bestStartIdx = 0;
+    let bestEndIdx = 0;
+    let bestScore = 0;
+    for (let s = 0; s < seqLen; s++) {
+      for (let e = s; e < Math.min(s + maxAnswerLength, seqLen); e++) {
+        const score = (startProbs[s] ?? 0) * (endProbs[e] ?? 0);
+        if (score > bestScore) {
+          bestScore = score;
+          bestStartIdx = s;
+          bestEndIdx = e;
+        }
+      }
+    }
+    const answerTokenIds = encoded.inputIds.slice(bestStartIdx, bestEndIdx + 1);
+    const answer = this.tokenizer.decode(answerTokenIds, true);
+    const charStart = this.tokenOffsetToCharOffset(context, question, encoded.inputIds, bestStartIdx);
+    const charEnd = this.tokenOffsetToCharOffset(context, question, encoded.inputIds, bestEndIdx) + 1;
     return {
-      answer: answer.text,
-      score: answer.score,
-      start: answer.start,
-      end: answer.end,
+      answer: answer || "",
+      score: bestScore,
+      start: charStart,
+      end: charEnd,
       processingTime: performance.now() - startTime
     };
   }
-  /**
-   * Find best answer span
-   */
-  findBestAnswer(context, question, _tokenIds, maxLength) {
-    const questionWords = question.toLowerCase().split(/\s+/);
-    const contextSentences = context.split(/[.!?]+/).filter((s) => s.trim());
-    let bestSentence = "";
-    let bestScore = 0;
-    let bestStart = 0;
-    for (const sentence of contextSentences) {
-      const words2 = sentence.toLowerCase().split(/\s+/);
-      let score = 0;
-      for (const qWord of questionWords) {
-        if (words2.some((w) => w.includes(qWord) || qWord.includes(w))) {
-          score += 1;
-        }
-      }
-      if (score > bestScore) {
-        bestScore = score;
-        bestSentence = sentence.trim();
-        bestStart = context.indexOf(sentence.trim());
-      }
-    }
-    const words = bestSentence.split(/\s+/);
-    if (words.length > maxLength) {
-      bestSentence = words.slice(0, maxLength).join(" ");
-    }
-    const normalizedScore = questionWords.length > 0 ? bestScore / questionWords.length : 0;
-    return {
-      text: bestSentence || "No answer found",
-      score: Math.min(normalizedScore, 1),
-      start: bestStart >= 0 ? bestStart : 0,
-      end: bestStart >= 0 ? bestStart + bestSentence.length : 0
-    };
+  tokenOffsetToCharOffset(context, _question, inputIds, tokenIdx) {
+    const decoded = this.tokenizer.decode(inputIds.slice(0, tokenIdx + 1), true);
+    const contextStart = context.indexOf(decoded.trim().split(" ").pop() ?? "");
+    return contextStart >= 0 ? contextStart : 0;
   }
-  /**
-   * Preprocess QA input
-   */
   async preprocess(input) {
-    if (!this.tokenizer) {
-      return [new EdgeFlowTensor(new Float32Array([0]), [1], "float32")];
-    }
     const qaInput = Array.isArray(input) ? input[0] : input;
     const encoded = this.tokenizer.encode(qaInput.question, {
       textPair: qaInput.context,
@@ -6886,9 +7464,6 @@ var QuestionAnsweringPipeline = class extends BasePipeline {
       new EdgeFlowTensor(BigInt64Array.from(encoded.attentionMask.map((m) => BigInt(m))), [1, encoded.attentionMask.length], "int64")
     ];
   }
-  /**
-   * Postprocess model output
-   */
   async postprocess(outputs, _options) {
     if (outputs.length < 2) {
       return { answer: "", score: 0, start: 0, end: 0 };
@@ -6913,13 +7488,13 @@ var QuestionAnsweringPipeline = class extends BasePipeline {
     }
     return {
       answer: "",
-      // Would need tokenizer to decode
       score: bestScore,
       start: bestStart,
       end: bestEnd
     };
   }
 };
+registerPipeline("question-answering", (config) => new QuestionAnsweringPipeline(config));
 
 // dist/pipelines/image-segmentation.js
 init_tensor();
@@ -7368,6 +7943,7 @@ registerPipeline("image-segmentation", (config) => new ImageSegmentationPipeline
 
 // dist/pipelines/index.js
 async function pipeline(task, options) {
+  registerAllBackends();
   const config = {
     task,
     model: options?.model ?? "default",
@@ -7407,8 +7983,14 @@ async function pipeline(task, options) {
     case "image-segmentation":
       pipelineInstance = new ImageSegmentationPipeline(config);
       break;
-    default:
-      throw new Error(`Unknown pipeline task: ${task}`);
+    default: {
+      const pluginEntry = getPluginPipeline(task);
+      if (pluginEntry) {
+        pipelineInstance = pluginEntry.factory(config);
+        break;
+      }
+      throw new Error(`Unknown pipeline task: "${task}". Register a plugin with registerPlugin() to add custom pipeline tasks.`);
+    }
   }
   await pipelineInstance.initialize();
   return pipelineInstance;
@@ -7421,6 +8003,98 @@ async function createPipelines(tasks, options) {
     result[task] = pipelines[i];
   }
   return result;
+}
+
+// dist/core/composer.js
+function compose(stages) {
+  if (stages.length === 0) {
+    throw new Error("[edgeFlow.js] compose() requires at least one stage");
+  }
+  let pipelineInstances = null;
+  async function ensureInitialised() {
+    if (pipelineInstances)
+      return pipelineInstances;
+    pipelineInstances = await Promise.all(stages.map((stage) => pipeline(stage.task, {
+      model: stage.model,
+      ...stage.options
+    })));
+    return pipelineInstances;
+  }
+  return {
+    get length() {
+      return stages.length;
+    },
+    async run(input) {
+      const instances = await ensureInitialised();
+      const stageResults = [];
+      const stageTimes = [];
+      let current = input;
+      const wallStart = performance.now();
+      for (let i = 0; i < stages.length; i++) {
+        const stage = stages[i];
+        const inst = instances[i];
+        if (stage.transform) {
+          current = stage.transform(current);
+        }
+        const t0 = performance.now();
+        current = await inst.run(current, stage.runOptions);
+        stageTimes.push(performance.now() - t0);
+        stageResults.push(current);
+      }
+      return {
+        output: current,
+        stages: stageResults,
+        totalTime: performance.now() - wallStart,
+        stageTimes
+      };
+    },
+    dispose() {
+      if (pipelineInstances) {
+        for (const inst of pipelineInstances) {
+          if (inst && typeof inst.dispose === "function") {
+            inst.dispose();
+          }
+        }
+        pipelineInstances = null;
+      }
+    }
+  };
+}
+function parallel(stages) {
+  if (stages.length === 0) {
+    throw new Error("[edgeFlow.js] parallel() requires at least one stage");
+  }
+  let pipelineInstances = null;
+  async function ensureInitialised() {
+    if (pipelineInstances)
+      return pipelineInstances;
+    pipelineInstances = await Promise.all(stages.map((s) => pipeline(s.task, {
+      model: s.model,
+      ...s.options
+    })));
+    return pipelineInstances;
+  }
+  return {
+    async run(input) {
+      const instances = await ensureInitialised();
+      const t0 = performance.now();
+      const outputs = await Promise.all(stages.map((stage, i) => {
+        const stageInput = stage.transform ? stage.transform(input) : input;
+        return instances[i].run(stageInput, stage.runOptions);
+      }));
+      return { outputs, totalTime: performance.now() - t0 };
+    },
+    dispose() {
+      if (pipelineInstances) {
+        for (const inst of pipelineInstances) {
+          if (inst && typeof inst.dispose === "function") {
+            inst.dispose();
+          }
+        }
+        pipelineInstances = null;
+      }
+    }
+  };
 }
 
 // dist/utils/index.js
@@ -10153,6 +10827,7 @@ export {
   TextClassificationPipeline,
   TextGenerationPipeline,
   Tokenizer,
+  TransformersAdapterRuntime,
   VERSION,
   WASMRuntime,
   WebGPURuntime,
@@ -10168,6 +10843,7 @@ export {
   cancelPreload,
   clearModelCache,
   compareBenchmarks,
+  compose,
   concat,
   configureScheduler,
   createAsciiHistogram,
@@ -10216,6 +10892,7 @@ export {
   getCachedModel,
   getDebugger,
   getDefaultModel,
+  getDeviceProfile,
   getInfo,
   getMemoryManager,
   getMemoryStats,
@@ -10223,14 +10900,18 @@ export {
   getModelInfo,
   getMonitor,
   getPipelineFactory,
+  getPluginMiddleware,
+  getPluginPipeline,
   getPreloadStatus,
   getPreloadedModel,
   getRuntimeManager,
   getScheduler,
+  getTransformersAdapter,
   inspectTensor,
   isModelCached,
   isSupported,
   linspace,
+  listPlugins,
   loadModel,
   loadModelData,
   loadModelFromBuffer,
@@ -10241,6 +10922,7 @@ export {
   modelExists,
   mul,
   ones,
+  parallel,
   pipeline,
   preload,
   preloadModel,
@@ -10254,11 +10936,15 @@ export {
   quantizeTensor,
   randn,
   random,
+  recommendModelVariant,
+  recommendQuantization,
   registerAllBackends,
   registerPipeline,
+  registerPlugin,
   registerRuntime,
   release,
   relu,
+  resetDeviceProfile,
   runBatchInference,
   benchmark as runBenchmark,
   runInference,
@@ -10271,6 +10957,8 @@ export {
   sum,
   tanh,
   tensor,
+  unregisterPlugin,
+  useTransformersBackend,
   visualizeModelArchitecture,
   withMemoryScope,
   withMemoryScopeSync,

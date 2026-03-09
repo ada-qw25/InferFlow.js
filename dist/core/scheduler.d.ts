@@ -22,10 +22,27 @@ export declare class InferenceScheduler {
     private readonly allTasks;
     private readonly batchers;
     private readonly listeners;
+    private readonly circuits;
     private globalRunningCount;
     private isProcessing;
     private disposed;
     constructor(options?: SchedulerOptions);
+    /**
+     * Get circuit breaker state for a model, creating default if absent
+     */
+    private getCircuit;
+    /**
+     * Check if the circuit for a model allows new tasks
+     */
+    private isCircuitOpen;
+    /**
+     * Record a success for circuit breaker
+     */
+    private circuitSuccess;
+    /**
+     * Record a failure for circuit breaker
+     */
+    private circuitFailure;
     /**
      * Get or create queue for a model
      */

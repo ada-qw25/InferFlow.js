@@ -2,8 +2,13 @@
  * edgeFlow.js - ONNX Runtime Backend
  *
  * Uses onnxruntime-web for real ONNX model inference.
+ * onnxruntime-web is an optional peer dependency loaded dynamically.
  */
 import { Runtime, RuntimeType, RuntimeCapabilities, LoadedModel, ModelLoadOptions, Tensor } from '../core/types.js';
+/**
+ * Check whether onnxruntime-web is importable.
+ */
+export declare function isOnnxAvailable(): Promise<boolean>;
 /**
  * ONNXRuntime - Real ONNX model inference using onnxruntime-web
  */
@@ -13,7 +18,7 @@ export declare class ONNXRuntime implements Runtime {
     private executionProvider;
     get capabilities(): RuntimeCapabilities;
     /**
-     * Check if ONNX Runtime is available
+     * Check if ONNX Runtime is available (peer dependency installed)
      */
     isAvailable(): Promise<boolean>;
     /**

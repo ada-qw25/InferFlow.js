@@ -7,9 +7,12 @@
 import {
   PipelineConfig,
   PipelineOptions,
+  LoadedModel,
 } from '../core/types.js';
 import { EdgeFlowTensor, softmax } from '../core/tensor.js';
 import { ImagePreprocessor, createImagePreprocessor } from '../utils/preprocessor.js';
+import { loadModelData } from '../utils/model-loader.js';
+import { loadModelFromBuffer, runInference } from '../core/runtime.js';
 import {
   BasePipeline,
   ImageClassificationResult,
@@ -18,114 +21,87 @@ import {
 } from './base.js';
 
 // ============================================================================
+// Default Model (MobileViT-small, quantized)
+// ============================================================================
+
+const DEFAULT_MODELS = {
+  model: 'https://huggingface.co/Xenova/mobilevit-small/resolve/main/onnx/model_quantized.onnx',
+};
+
+
+// ============================================================================
 // Image Classification Pipeline
 // ============================================================================
 
-/**
- * Image classification options
- */
 export interface ImageClassificationOptions extends PipelineOptions {
-  /** Return all labels with scores */
   returnAllScores?: boolean;
-  /** Custom labels */
   labels?: string[];
-  /** Number of top predictions to return */
   topK?: number;
 }
 
-/**
- * Image classification input types
- */
-export type ImageInput = 
-  | HTMLImageElement 
-  | HTMLCanvasElement 
-  | ImageBitmap 
-  | ImageData 
-  | string; // URL
+export type ImageInput =
+  | HTMLImageElement
+  | HTMLCanvasElement
+  | ImageBitmap
+  | ImageData
+  | string;
 
-/**
- * ImageClassificationPipeline - Classify images
- * 
- * **Status: Experimental** - Uses heuristic-based inference, not a real model.
- * For production use, pair with the transformers.js adapter backend or
- * provide a real ONNX model.
- */
 export class ImageClassificationPipeline extends BasePipeline<
   ImageInput | ImageInput[],
   ImageClassificationResult | ImageClassificationResult[]
 > {
-  static readonly experimental = true;
-
   private preprocessor: ImagePreprocessor | null = null;
+  private onnxModel: LoadedModel | null = null;
   private labels: string[];
-  private numClasses: number;
+  private modelUrl: string;
 
   constructor(
-    config: PipelineConfig, 
+    config: PipelineConfig,
     labels?: string[],
-    numClasses: number = 1000
+    _numClasses: number = 1000
   ) {
     super(config);
     this.labels = labels ?? IMAGENET_LABELS;
-    this.numClasses = numClasses;
+    this.modelUrl = config.model !== 'default' ? config.model : DEFAULT_MODELS.model;
   }
 
-  /**
-   * Initialize pipeline
-   */
   override async initialize(): Promise<void> {
     await super.initialize();
-    
+
     if (!this.preprocessor) {
       this.preprocessor = createImagePreprocessor('imagenet');
     }
 
-    if (this.config.model === 'default') {
-      console.warn(
-        '[edgeFlow.js] ImageClassificationPipeline is running in experimental mode ' +
-        'with heuristic-based inference. For production accuracy, provide a real ' +
-        'ONNX model or use the transformers.js adapter backend.'
-      );
+    if (!this.onnxModel) {
+      const modelData = await loadModelData(this.modelUrl, { cache: this.config.cache ?? true });
+      this.onnxModel = await loadModelFromBuffer(modelData);
     }
   }
 
-  /**
-   * Set custom labels
-   */
   setLabels(labels: string[]): void {
     this.labels = labels;
-    this.numClasses = labels.length;
   }
 
-  /**
-   * Run classification
-   */
   override async run(
     input: ImageInput | ImageInput[],
     options?: ImageClassificationOptions
   ): Promise<ImageClassificationResult | ImageClassificationResult[]> {
     const isBatch = Array.isArray(input);
     const inputs = isBatch ? input : [input];
-    
+
     await this.initialize();
-    
+
     const startTime = performance.now();
     const results: ImageClassificationResult[] = [];
 
     for (const image of inputs) {
-      // Preprocess
       const tensorInputs = await this.preprocess(image);
-      
-      // Run inference
-      const outputs = await this.runInference(tensorInputs);
-      
-      // Postprocess
+      const outputs = await this.runModelInference(tensorInputs);
       const result = await this.postprocess(outputs, options);
       results.push(result);
     }
 
     const processingTime = performance.now() - startTime;
-    
     for (const result of results) {
       result.processingTime = processingTime / results.length;
     }
@@ -133,48 +109,21 @@ export class ImageClassificationPipeline extends BasePipeline<
     return isBatch ? results : results[0]!;
   }
 
-  /**
-   * Preprocess image input
-   */
   protected override async preprocess(input: ImageInput | ImageInput[]): Promise<EdgeFlowTensor[]> {
     const image = Array.isArray(input) ? input[0]! : input;
-    
-    // Process image
     const tensor = await this.preprocessor!.process(image);
-    
-    // Add batch dimension if needed
+
     if (tensor.shape.length === 3) {
       return [tensor.reshape([1, ...tensor.shape])];
     }
-    
     return [tensor];
   }
 
-  /**
-   * Run model inference
-   */
-  private async runInference(inputs: EdgeFlowTensor[]): Promise<EdgeFlowTensor[]> {
-    // Generate mock classification logits for demo
-    // In production, this would call the actual model
-    const logits = new Float32Array(this.numClasses);
-    
-    // Generate deterministic pseudo-logits based on input
-    const inputData = inputs[0]?.toFloat32Array() ?? new Float32Array(0);
-    let sum = 0;
-    for (let i = 0; i < Math.min(1000, inputData.length); i++) {
-      sum += inputData[i] ?? 0;
-    }
-    
-    for (let i = 0; i < this.numClasses; i++) {
-      logits[i] = Math.sin(sum * (i + 1) * 0.1) * 3;
-    }
-
-    return [new EdgeFlowTensor(logits, [1, this.numClasses], 'float32')];
+  private async runModelInference(inputs: EdgeFlowTensor[]): Promise<EdgeFlowTensor[]> {
+    const outputs = await runInference(this.onnxModel!, inputs);
+    return outputs as EdgeFlowTensor[];
   }
 
-  /**
-   * Postprocess model outputs
-   */
   protected override async postprocess(
     outputs: EdgeFlowTensor[],
     options?: ImageClassificationOptions
@@ -184,20 +133,12 @@ export class ImageClassificationPipeline extends BasePipeline<
       return { label: 'unknown', score: 0 };
     }
 
-    // Apply softmax
     const probs = softmax(logits, -1) as EdgeFlowTensor;
     const probsArray = probs.toFloat32Array();
 
-    const topK = options?.topK ?? 1;
-
-    if (topK > 1 || options?.returnAllScores) {
-      // Return top-K results (simplified to top-1 here)
-    }
-
-    // Find argmax
     let maxIdx = 0;
     let maxScore = probsArray[0] ?? 0;
-    
+
     for (let i = 1; i < probsArray.length; i++) {
       if ((probsArray[i] ?? 0) > maxScore) {
         maxScore = probsArray[i] ?? 0;
@@ -207,10 +148,7 @@ export class ImageClassificationPipeline extends BasePipeline<
 
     const label = options?.labels?.[maxIdx] ?? this.labels[maxIdx] ?? `class_${maxIdx}`;
 
-    return {
-      label,
-      score: maxScore,
-    };
+    return { label, score: maxScore };
   }
 }
 
@@ -218,9 +156,6 @@ export class ImageClassificationPipeline extends BasePipeline<
 // Factory Function
 // ============================================================================
 
-/**
- * Create image classification pipeline
- */
 export function createImageClassificationPipeline(
   config: Partial<PipelineConfig> = {},
   labels?: string[]
@@ -237,5 +172,4 @@ export function createImageClassificationPipeline(
   );
 }
 
-// Register pipeline
 registerPipeline('image-classification', (config) => new ImageClassificationPipeline(config));

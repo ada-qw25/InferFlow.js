@@ -58,7 +58,12 @@ export declare abstract class BasePipeline<TInput, TOutput extends PipelineResul
     protected isReady: boolean;
     constructor(config: PipelineConfig);
     /**
-     * Initialize the pipeline (load model)
+     * Initialize the pipeline (load model).
+     *
+     * Skips model loading when `config.model === 'default'` — concrete
+     * subclasses that define their own DEFAULT_MODELS handle all model
+     * loading in their overridden `initialize()` methods, so the base
+     * should not attempt to fetch a URL called "default".
      */
     initialize(): Promise<void>;
     /**

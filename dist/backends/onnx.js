@@ -2,12 +2,37 @@
  * edgeFlow.js - ONNX Runtime Backend
  *
  * Uses onnxruntime-web for real ONNX model inference.
+ * onnxruntime-web is an optional peer dependency loaded dynamically.
  */
-import * as ort from 'onnxruntime-web';
 import { EdgeFlowError, ErrorCodes, } from '../core/types.js';
 import { LoadedModelImpl } from '../core/runtime.js';
 import { EdgeFlowTensor } from '../core/tensor.js';
 import { getMemoryManager } from '../core/memory.js';
+// Lazy-loaded onnxruntime-web module
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let ort = null;
+async function getOrt() {
+    if (ort)
+        return ort;
+    try {
+        // Import the WASM-only sub-path so Vite rewrites the bare specifier
+        // to ort.wasm.bundle.min.mjs. This avoids loading the JSEP/WebGPU
+        // worker module (jsep.mjs) that ort.bundle.min.mjs eagerly fetches
+        // whenever navigator.gpu exists — which causes a 404 in dev servers
+        // that restrict ES module imports from /public.
+        ort = await import('onnxruntime-web/wasm');
+        return ort;
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Check whether onnxruntime-web is importable.
+ */
+export async function isOnnxAvailable() {
+    return (await getOrt()) != null;
+}
 const sessionStore = new Map();
 // ============================================================================
 // ONNX Runtime Implementation
@@ -30,10 +55,10 @@ export class ONNXRuntime {
         };
     }
     /**
-     * Check if ONNX Runtime is available
+     * Check if ONNX Runtime is available (peer dependency installed)
      */
     async isAvailable() {
-        return true;
+        return isOnnxAvailable();
     }
     /**
      * Initialize the ONNX runtime
@@ -41,9 +66,18 @@ export class ONNXRuntime {
     async initialize() {
         if (this.initialized)
             return;
-        // Configure WASM paths for CDN loading (required for browser deployment)
-        if (typeof window !== 'undefined') {
-            ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/';
+        const ortModule = await getOrt();
+        if (!ortModule) {
+            throw new EdgeFlowError('onnxruntime-web is not installed. Install it with: npm install onnxruntime-web', ErrorCodes.RUNTIME_NOT_AVAILABLE);
+        }
+        // Configure WASM backend for browser use.
+        // numThreads=1 disables multi-threading so ort only needs the plain
+        // .wasm binary — the worker .mjs file is never requested, which avoids
+        // Vite's restriction on importing files from /public as ES modules.
+        // Consumers should copy onnxruntime-web/dist/*.wasm to public/ort/.
+        if (typeof window !== 'undefined' && ortModule.env?.wasm) {
+            ortModule.env.wasm.wasmPaths = '/ort/';
+            ortModule.env.wasm.numThreads = 1;
         }
         this.initialized = true;
     }
@@ -55,29 +89,19 @@ export class ONNXRuntime {
             await this.initialize();
         }
         try {
-            // Create session options with multiple execution providers
-            // ONNX Runtime will try them in order and use the first available one
+            const ortModule = await getOrt();
+            if (!ortModule) {
+                throw new Error('onnxruntime-web is not installed');
+            }
+            // WASM-only execution provider — WebGPU acceleration can be added
+            // later via the dedicated WebGPURuntime backend.
             const sessionOptions = {
-                executionProviders: ['webgpu', 'wasm'], // Try WebGPU first, fallback to WASM
+                executionProviders: ['wasm'],
                 graphOptimizationLevel: 'all',
             };
-            // Create inference session (convert ArrayBuffer to Uint8Array)
             const modelBytes = new Uint8Array(modelData);
-            let session;
-            try {
-                session = await ort.InferenceSession.create(modelBytes, sessionOptions);
-                console.log('[ONNX] Session created (tried WebGPU → WASM)');
-            }
-            catch (e) {
-                // If WebGPU fails, try WASM only
-                console.log('[ONNX] WebGPU not available, falling back to WASM. Reason:', e instanceof Error ? e.message : e);
-                const wasmOptions = {
-                    executionProviders: ['wasm'],
-                    graphOptimizationLevel: 'all',
-                };
-                session = await ort.InferenceSession.create(modelBytes, wasmOptions);
-                console.log('[ONNX] Session created with WASM backend');
-            }
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const session = await ortModule.InferenceSession.create(modelBytes, sessionOptions);
             // Get input/output names
             const inputNames = session.inputNames;
             const outputNames = session.outputNames;
@@ -93,12 +117,12 @@ export class ONNXRuntime {
             const metadata = {
                 name: options.metadata?.name ?? 'onnx-model',
                 version: '1.0.0',
-                inputs: inputNames.map(name => ({
+                inputs: inputNames.map((name) => ({
                     name,
                     dtype: 'float32',
                     shape: [-1], // Dynamic shape
                 })),
-                outputs: outputNames.map(name => ({
+                outputs: outputNames.map((name) => ({
                     name,
                     dtype: 'float32',
                     shape: [-1],
@@ -129,32 +153,29 @@ export class ONNXRuntime {
         }
         const { session, inputNames, outputNames } = sessionData;
         try {
-            // Prepare input feeds
+            const ortModule = await getOrt();
             const feeds = {};
             for (let i = 0; i < Math.min(inputs.length, inputNames.length); i++) {
                 const inputName = inputNames[i];
                 const inputTensor = inputs[i];
                 if (inputName && inputTensor) {
-                    // Convert to ONNX tensor with correct dtype
                     const dtype = inputTensor.dtype;
                     let ortTensor;
                     if (dtype === 'int64') {
-                        // Get raw BigInt64Array data directly
                         const data = inputTensor.data;
-                        ortTensor = new ort.Tensor('int64', data, inputTensor.shape);
+                        ortTensor = new ortModule.Tensor('int64', data, inputTensor.shape);
                     }
                     else if (dtype === 'int32') {
                         const data = inputTensor.data;
-                        ortTensor = new ort.Tensor('int32', data, inputTensor.shape);
+                        ortTensor = new ortModule.Tensor('int32', data, inputTensor.shape);
                     }
                     else {
                         const data = inputTensor.toFloat32Array();
-                        ortTensor = new ort.Tensor('float32', data, inputTensor.shape);
+                        ortTensor = new ortModule.Tensor('float32', data, inputTensor.shape);
                     }
                     feeds[inputName] = ortTensor;
                 }
             }
-            // Run inference
             const results = await session.run(feeds);
             // Convert outputs to EdgeFlowTensor
             const outputs = [];
@@ -182,31 +203,26 @@ export class ONNXRuntime {
         }
         const { session, inputNames, outputNames } = sessionData;
         try {
-            // Prepare input feeds from named inputs
+            const ortModule = await getOrt();
             const feeds = {};
-            // Log expected vs provided inputs for debugging
-            console.log('[ONNX] Model expects inputs:', inputNames);
-            console.log('[ONNX] Provided inputs:', Array.from(namedInputs.keys()));
             for (const [inputName, inputTensor] of namedInputs) {
                 const tensor = inputTensor;
                 const dtype = tensor.dtype;
                 let ortTensor;
                 if (dtype === 'int64') {
                     const data = tensor.data;
-                    ortTensor = new ort.Tensor('int64', data, tensor.shape);
+                    ortTensor = new ortModule.Tensor('int64', data, tensor.shape);
                 }
                 else if (dtype === 'int32') {
                     const data = tensor.data;
-                    ortTensor = new ort.Tensor('int32', data, tensor.shape);
+                    ortTensor = new ortModule.Tensor('int32', data, tensor.shape);
                 }
                 else {
                     const data = tensor.toFloat32Array();
-                    ortTensor = new ort.Tensor('float32', data, tensor.shape);
+                    ortTensor = new ortModule.Tensor('float32', data, tensor.shape);
                 }
                 feeds[inputName] = ortTensor;
-                console.log(`[ONNX] Input '${inputName}': shape=${tensor.shape}, dtype=${dtype}`);
             }
-            // Run inference
             const results = await session.run(feeds);
             // Convert outputs to EdgeFlowTensor
             const outputs = [];
@@ -221,10 +237,7 @@ export class ONNXRuntime {
             return outputs;
         }
         catch (error) {
-            // Log detailed error info
-            console.error('[ONNX] Inference failed. Model expects:', inputNames);
-            console.error('[ONNX] Provided:', Array.from(namedInputs.keys()));
-            throw new EdgeFlowError(`ONNX inference failed: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INFERENCE_FAILED, { modelId: model.id, error });
+            throw new EdgeFlowError(`ONNX inference failed: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INFERENCE_FAILED, { modelId: model.id, expectedInputs: inputNames, providedInputs: Array.from(namedInputs.keys()), error });
         }
     }
     /**

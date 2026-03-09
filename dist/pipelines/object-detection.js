@@ -3,9 +3,17 @@
  *
  * Detect objects in images with bounding boxes and class labels.
  */
-import { BasePipeline } from './base.js';
+import { BasePipeline, registerPipeline } from './base.js';
 import { EdgeFlowTensor } from '../core/tensor.js';
 import { ImagePreprocessor } from '../utils/preprocessor.js';
+import { loadModelData } from '../utils/model-loader.js';
+import { loadModelFromBuffer, runInference } from '../core/runtime.js';
+// ============================================================================
+// Default Model (YOLOS-tiny, quantized)
+// ============================================================================
+const DEFAULT_MODELS = {
+    model: 'https://huggingface.co/Xenova/yolos-tiny/resolve/main/onnx/model_quantized.onnx',
+};
 // ============================================================================
 // COCO Labels
 // ============================================================================
@@ -26,28 +34,18 @@ export const COCO_LABELS = [
 // ============================================================================
 // Object Detection Pipeline
 // ============================================================================
-/**
- * ObjectDetectionPipeline - Detect objects in images
- *
- * @example
- * ```typescript
- * const detector = await pipeline('object-detection');
- * const detections = await detector.run('image.jpg', { threshold: 0.7 });
- *
- * for (const det of detections) {
- *   console.log(`${det.label}: ${det.score.toFixed(2)} at`, det.box);
- * }
- * ```
- */
 export class ObjectDetectionPipeline extends BasePipeline {
     preprocessor;
+    onnxModel = null;
     labels;
+    modelUrl;
     constructor(config, labels) {
         super(config ?? {
             task: 'object-detection',
             model: 'default',
         });
         this.labels = labels ?? COCO_LABELS;
+        this.modelUrl = (config?.model && config.model !== 'default') ? config.model : DEFAULT_MODELS.model;
         this.preprocessor = new ImagePreprocessor({
             width: 640,
             height: 640,
@@ -56,69 +54,62 @@ export class ObjectDetectionPipeline extends BasePipeline {
             channelFormat: 'CHW',
         });
     }
-    /**
-     * Set custom labels
-     */
+    async initialize() {
+        await super.initialize();
+        if (!this.onnxModel) {
+            const modelData = await loadModelData(this.modelUrl, { cache: this.config.cache ?? true });
+            this.onnxModel = await loadModelFromBuffer(modelData);
+        }
+    }
     setLabels(labels) {
         this.labels = labels;
     }
-    /**
-     * Preprocess image for detection
-     */
+    async run(input, options) {
+        await this.initialize();
+        const tensorInputs = await this.preprocess(input);
+        const outputs = await this.runModelInference(tensorInputs);
+        return this.postprocess(outputs, options);
+    }
     async preprocess(input) {
         const inputs = Array.isArray(input) ? input : [input];
         if (inputs.length === 1) {
             const tensor = await this.preprocessor.process(inputs[0]);
-            // Add batch dimension
             return [new EdgeFlowTensor(tensor.toFloat32Array(), [1, ...tensor.shape], 'float32')];
         }
         return [await this.preprocessor.processBatch(inputs)];
     }
-    /**
-     * Postprocess detection outputs
-     */
+    async runModelInference(inputs) {
+        const outputs = await runInference(this.onnxModel, inputs);
+        return outputs;
+    }
     async postprocess(outputs, options) {
         const opts = options ?? {};
         const threshold = opts.threshold ?? 0.5;
         const topK = opts.topK ?? 100;
         const nms = opts.nms ?? true;
         const iouThreshold = opts.iouThreshold ?? 0.5;
-        // Output format depends on model architecture
-        // Common formats: YOLO, SSD, DETR
-        // This is a generic implementation
         if (!outputs[0]) {
             return [];
         }
         const outputData = outputs[0].toFloat32Array();
         const shape = [...outputs[0].shape];
-        // Try to detect output format and parse accordingly
         const detections = this.parseDetections(outputData, shape, threshold);
-        // Apply NMS if enabled
         let filtered = nms ? this.nonMaxSuppression(detections, iouThreshold) : detections;
-        // Sort by confidence and take top-k
         filtered.sort((a, b) => b.score - a.score);
         filtered = filtered.slice(0, topK);
         return filtered;
     }
-    /**
-     * Parse raw model output into detections
-     */
     parseDetections(data, shape, threshold) {
         const detections = [];
-        // Handle different output formats
-        // Format 1: [batch, num_boxes, 5+num_classes] (YOLO-style)
-        // Format 2: [batch, num_boxes, 4] + [batch, num_boxes, num_classes] (separate boxes and scores)
         const numBoxes = shape[1] ?? 0;
         const boxSize = shape[2] ?? 0;
         if (boxSize >= 5) {
-            // YOLO-style output: [x, y, w, h, objectness, class_scores...]
             const numClasses = boxSize - 5;
             for (let i = 0; i < numBoxes; i++) {
                 const offset = i * boxSize;
                 const objectness = data[offset + 4] ?? 0;
                 if (objectness < threshold)
                     continue;
-                // Find best class
                 let maxClassScore = 0;
                 let maxClassIdx = 0;
                 for (let c = 0; c < numClasses; c++) {
@@ -131,7 +122,6 @@ export class ObjectDetectionPipeline extends BasePipeline {
                 const confidence = objectness * maxClassScore;
                 if (confidence < threshold)
                     continue;
-                // Box coordinates (normalized)
                 const x = data[offset] ?? 0;
                 const y = data[offset + 1] ?? 0;
                 const w = data[offset + 2] ?? 0;
@@ -156,8 +146,6 @@ export class ObjectDetectionPipeline extends BasePipeline {
             }
         }
         else if (boxSize === 4) {
-            // Simple box format: [x1, y1, x2, y2]
-            // Scores should be in outputs[1]
             for (let i = 0; i < numBoxes; i++) {
                 const offset = i * boxSize;
                 const x1 = data[offset] ?? 0;
@@ -185,13 +173,9 @@ export class ObjectDetectionPipeline extends BasePipeline {
         }
         return detections;
     }
-    /**
-     * Non-maximum suppression
-     */
     nonMaxSuppression(detections, iouThreshold) {
         if (detections.length === 0)
             return [];
-        // Sort by confidence
         const sorted = [...detections].sort((a, b) => b.score - a.score);
         const selected = [];
         const active = new Array(sorted.length).fill(true);
@@ -200,7 +184,6 @@ export class ObjectDetectionPipeline extends BasePipeline {
                 continue;
             const current = sorted[i];
             selected.push(current);
-            // Suppress overlapping boxes
             for (let j = i + 1; j < sorted.length; j++) {
                 if (!active[j])
                     continue;
@@ -215,9 +198,6 @@ export class ObjectDetectionPipeline extends BasePipeline {
         }
         return selected;
     }
-    /**
-     * Compute Intersection over Union
-     */
     computeIoU(a, b) {
         const xOverlap = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
         const yOverlap = Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
@@ -234,4 +214,5 @@ export class ObjectDetectionPipeline extends BasePipeline {
 export function createObjectDetectionPipeline(config, labels) {
     return new ObjectDetectionPipeline(config, labels);
 }
+registerPipeline('object-detection', (config) => new ObjectDetectionPipeline(config));
 //# sourceMappingURL=object-detection.js.map

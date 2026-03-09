@@ -6,56 +6,24 @@
 import { PipelineConfig, PipelineOptions } from '../core/types.js';
 import { EdgeFlowTensor } from '../core/tensor.js';
 import { BasePipeline, ImageClassificationResult } from './base.js';
-/**
- * Image classification options
- */
 export interface ImageClassificationOptions extends PipelineOptions {
-    /** Return all labels with scores */
     returnAllScores?: boolean;
-    /** Custom labels */
     labels?: string[];
-    /** Number of top predictions to return */
     topK?: number;
 }
-/**
- * Image classification input types
- */
 export type ImageInput = HTMLImageElement | HTMLCanvasElement | ImageBitmap | ImageData | string;
-/**
- * ImageClassificationPipeline - Classify images
- */
 export declare class ImageClassificationPipeline extends BasePipeline<ImageInput | ImageInput[], ImageClassificationResult | ImageClassificationResult[]> {
     private preprocessor;
+    private onnxModel;
     private labels;
-    private numClasses;
-    constructor(config: PipelineConfig, labels?: string[], numClasses?: number);
-    /**
-     * Initialize pipeline
-     */
+    private modelUrl;
+    constructor(config: PipelineConfig, labels?: string[], _numClasses?: number);
     initialize(): Promise<void>;
-    /**
-     * Set custom labels
-     */
     setLabels(labels: string[]): void;
-    /**
-     * Run classification
-     */
     run(input: ImageInput | ImageInput[], options?: ImageClassificationOptions): Promise<ImageClassificationResult | ImageClassificationResult[]>;
-    /**
-     * Preprocess image input
-     */
     protected preprocess(input: ImageInput | ImageInput[]): Promise<EdgeFlowTensor[]>;
-    /**
-     * Run model inference
-     */
-    private runInference;
-    /**
-     * Postprocess model outputs
-     */
+    private runModelInference;
     protected postprocess(outputs: EdgeFlowTensor[], options?: ImageClassificationOptions): Promise<ImageClassificationResult>;
 }
-/**
- * Create image classification pipeline
- */
 export declare function createImageClassificationPipeline(config?: Partial<PipelineConfig>, labels?: string[]): ImageClassificationPipeline;
 //# sourceMappingURL=image-classification.d.ts.map

@@ -1,34 +1,56 @@
 /**
  * edgeFlow.js - Zero-shot Classification Pipeline
  *
- * Classify text into any set of labels without fine-tuning.
+ * Classify text into any set of labels without fine-tuning,
+ * using a real NLI (Natural Language Inference) model.
  */
-import { BasePipeline } from './base.js';
+import { BasePipeline, registerPipeline } from './base.js';
 import { EdgeFlowTensor, softmax } from '../core/tensor.js';
+import { Tokenizer } from '../utils/tokenizer.js';
+import { loadModelData } from '../utils/model-loader.js';
+import { loadModelFromBuffer, runInferenceNamed } from '../core/runtime.js';
+// ============================================================================
+// Default Model (DistilBART fine-tuned on MNLI)
+// ============================================================================
+const DEFAULT_MODELS = {
+    model: 'https://huggingface.co/Xenova/nli-deberta-v3-small/resolve/main/onnx/model_quantized.onnx',
+    tokenizer: 'https://huggingface.co/Xenova/nli-deberta-v3-small/resolve/main/tokenizer.json',
+};
+// NLI output indices: [contradiction, neutral, entailment]
+const ENTAILMENT_IDX = 2;
+// ============================================================================
+// Zero-shot Classification Pipeline
+// ============================================================================
 export class ZeroShotClassificationPipeline extends BasePipeline {
     tokenizer = null;
+    onnxModel = null;
     hypothesisTemplate = 'This text is about {label}.';
+    modelUrl;
+    tokenizerUrl;
     constructor(config) {
         super(config ?? {
             task: 'zero-shot-classification',
             model: 'default',
         });
+        this.modelUrl = (config?.model && config.model !== 'default') ? config.model : DEFAULT_MODELS.model;
+        this.tokenizerUrl = DEFAULT_MODELS.tokenizer;
     }
-    /**
-     * Set tokenizer
-     */
+    async initialize() {
+        await super.initialize();
+        if (!this.tokenizer) {
+            this.tokenizer = await Tokenizer.fromUrl(this.tokenizerUrl);
+        }
+        if (!this.onnxModel) {
+            const modelData = await loadModelData(this.modelUrl, { cache: this.config.cache ?? true });
+            this.onnxModel = await loadModelFromBuffer(modelData);
+        }
+    }
     setTokenizer(tokenizer) {
         this.tokenizer = tokenizer;
     }
-    /**
-     * Run classification (convenience method with separate arguments)
-     */
     async classify(text, candidateLabels, options) {
         return this.run({ text, candidateLabels }, options);
     }
-    /**
-     * Run classification
-     */
     async run(input, options) {
         await this.initialize();
         const { text, candidateLabels } = input;
@@ -39,31 +61,22 @@ export class ZeroShotClassificationPipeline extends BasePipeline {
         const results = await Promise.all(texts.map(t => this.classifySingle(t, candidateLabels, template, multiLabel)));
         return Array.isArray(text) ? results : results[0];
     }
-    /**
-     * Classify a single text
-     */
     async classifySingle(text, candidateLabels, template, multiLabel) {
         const startTime = performance.now();
-        // Create hypothesis for each label
         const hypotheses = candidateLabels.map(label => template.replace('{label}', label));
-        // Score each hypothesis
         const scores = [];
         for (const hypothesis of hypotheses) {
             const score = await this.scoreHypothesis(text, hypothesis);
             scores.push(score);
         }
-        // Normalize scores
         let normalizedScores;
         if (multiLabel) {
-            // Sigmoid for independent probabilities
             normalizedScores = scores.map(s => 1 / (1 + Math.exp(-s)));
         }
         else {
-            // Softmax for mutually exclusive labels
             const tensor = new EdgeFlowTensor(new Float32Array(scores), [scores.length], 'float32');
             normalizedScores = Array.from(softmax(tensor).toFloat32Array());
         }
-        // Sort by score
         const indexed = candidateLabels.map((label, i) => ({
             label,
             score: normalizedScores[i] ?? 0,
@@ -77,37 +90,31 @@ export class ZeroShotClassificationPipeline extends BasePipeline {
         };
     }
     /**
-     * Score a single hypothesis using NLI
+     * Score a single hypothesis using the real NLI ONNX model.
+     * Returns the entailment logit.
      */
     async scoreHypothesis(premise, hypothesis) {
-        if (!this.tokenizer) {
-            throw new Error('Tokenizer not set. Call setTokenizer() first.');
-        }
-        // Encode premise-hypothesis pair (for future model integration)
-        this.tokenizer.encode(premise, {
+        const encoded = this.tokenizer.encode(premise, {
             textPair: hypothesis,
             addSpecialTokens: true,
             maxLength: 512,
             truncation: true,
             returnAttentionMask: true,
-            returnTokenTypeIds: true,
         });
-        // For NLI models, output is typically [contradiction, neutral, entailment]
-        // Return the entailment score
-        // Simplified: return random score for now (real implementation needs model output)
-        return Math.random();
+        const inputIds = new EdgeFlowTensor(BigInt64Array.from(encoded.inputIds.map(id => BigInt(id))), [1, encoded.inputIds.length], 'int64');
+        const attentionMask = new EdgeFlowTensor(BigInt64Array.from(encoded.attentionMask.map(m => BigInt(m))), [1, encoded.attentionMask.length], 'int64');
+        const namedInputs = new Map();
+        namedInputs.set('input_ids', inputIds);
+        namedInputs.set('attention_mask', attentionMask);
+        const outputs = await runInferenceNamed(this.onnxModel, namedInputs);
+        const logits = outputs[0].toFloat32Array();
+        // Return entailment logit (index 2 in [contradiction, neutral, entailment])
+        return logits[ENTAILMENT_IDX] ?? 0;
     }
-    /**
-     * Preprocess - not directly used (handled in scoreHypothesis)
-     */
     async preprocess(input) {
         const { text, candidateLabels } = input;
-        // Encode first text-label pair for shape reference
         const firstText = Array.isArray(text) ? text[0] ?? '' : text;
         const firstLabel = candidateLabels[0] ?? '';
-        if (!this.tokenizer) {
-            return [new EdgeFlowTensor(new Float32Array([0]), [1], 'float32')];
-        }
         const encoded = this.tokenizer.encode(firstText, {
             textPair: this.hypothesisTemplate.replace('{label}', firstLabel),
             addSpecialTokens: true,
@@ -115,9 +122,6 @@ export class ZeroShotClassificationPipeline extends BasePipeline {
         });
         return [new EdgeFlowTensor(BigInt64Array.from(encoded.inputIds.map(id => BigInt(id))), [1, encoded.inputIds.length], 'int64')];
     }
-    /**
-     * Postprocess - not directly used
-     */
     async postprocess(_outputs, _options) {
         return {
             sequence: '',
@@ -132,4 +136,5 @@ export class ZeroShotClassificationPipeline extends BasePipeline {
 export function createZeroShotClassificationPipeline(config) {
     return new ZeroShotClassificationPipeline(config);
 }
+registerPipeline('zero-shot-classification', (config) => new ZeroShotClassificationPipeline(config));
 //# sourceMappingURL=zero-shot-classification.js.map

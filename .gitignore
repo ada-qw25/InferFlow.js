@@ -20,6 +20,9 @@ yarn-error.log*
 # Test coverage
 coverage/
 
+# Playwright / E2E test output
+test-results/
+
 # Environment
 .env
 .env.local
@@ -35,3 +38,6 @@ temp/
 .temp/
 .vercel
 .env*.local
+
+# Personal docs (not for public repo)
+INTERVIEW_PREP.md

@@ -80,9 +80,29 @@ export declare class MemoryManager {
      */
     private checkMemoryThreshold;
     /**
-     * Garbage collection helper
+     * Garbage collection helper.
+     *
+     * Identifies stale resources and optionally evicts them.
+     * @param evict - If true, actually dispose stale resources (default: false)
+     * @param maxAge - Resources older than this (ms) are considered stale (default: 5 min)
      */
-    gc(): void;
+    gc(evict?: boolean, maxAge?: number): void;
+    /**
+     * Query actual browser memory usage via performance.measureUserAgentSpecificMemory()
+     * (Chrome 89+, requires cross-origin isolation). Returns null if unavailable.
+     */
+    measureBrowserMemory(): Promise<{
+        bytes: number;
+        breakdown: Array<{
+            bytes: number;
+            types: string[];
+        }>;
+    } | null>;
+    /**
+     * Get the device's total memory hint (navigator.deviceMemory).
+     * Returns null if unavailable. Value is in GiB, rounded (e.g. 4, 8).
+     */
+    getDeviceMemory(): number | null;
     /**
      * Get memory statistics
      */

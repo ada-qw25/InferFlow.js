@@ -55,11 +55,18 @@ export interface WorkerPoolOptions {
  */
 export declare function serializeTensor(tensor: Tensor): SerializedTensor;
 /**
- * Deserialize a tensor from worker
+ * Deserialize a tensor from worker.
+ * Uses a lazy import to avoid circular dependency issues.
  */
-export declare function deserializeTensor(serialized: SerializedTensor): Tensor;
+export declare function deserializeTensor(serialized: SerializedTensor): Promise<Tensor>;
 /**
- * InferenceWorker - Wrapper for a single Web Worker
+ * Synchronous deserialisation used internally where async is not feasible.
+ * Requires EdgeFlowTensor to be passed in to avoid require().
+ */
+export declare function deserializeTensorSync(serialized: SerializedTensor, TensorClass: new (data: Float32Array, shape: number[], dtype: string) => Tensor): Tensor;
+export type WorkerHealthState = 'alive' | 'dead' | 'restarting';
+/**
+ * InferenceWorker - Wrapper for a single Web Worker with auto-restart
  */
 export declare class InferenceWorker {
     private worker;
@@ -67,11 +74,27 @@ export declare class InferenceWorker {
     private isReady;
     private readyPromise;
     private readyResolve;
+    private workerUrl;
+    private _health;
+    private restartAttempts;
     constructor(workerUrl?: string);
+    get health(): WorkerHealthState;
     /**
      * Initialize the worker
      */
     private initWorker;
+    /**
+     * Handle worker crash: reject pending, mark dead, attempt restart
+     */
+    private handleCrash;
+    /**
+     * Restart the worker with exponential backoff
+     */
+    private attemptRestart;
+    /**
+     * Restart: terminate old, create new
+     */
+    restart(): void;
     /**
      * Create worker code as blob URL
      */
@@ -109,21 +132,27 @@ export declare class InferenceWorker {
     terminate(): void;
 }
 /**
- * WorkerPool - Manage multiple workers for parallel inference
+ * WorkerPool - Manage multiple workers for parallel inference.
+ * Automatically falls back to healthy workers when one is dead.
  */
 export declare class WorkerPool {
     private workers;
     private currentIndex;
     private modelAssignments;
+    private poolOptions;
     constructor(options?: WorkerPoolOptions);
     /**
-     * Get next worker (round-robin)
+     * Get next healthy worker (round-robin, skipping dead ones)
      */
-    private getNextWorker;
+    private getNextHealthyWorker;
     /**
-     * Get worker for a specific model
+     * Get worker for a specific model, falling back to any healthy worker
      */
     private getWorkerForModel;
+    /**
+     * Replace a worker at a given index with a fresh one
+     */
+    replaceWorker(index: number): void;
     /**
      * Initialize all workers
      */
@@ -136,7 +165,7 @@ export declare class WorkerPool {
         cache?: boolean;
     }): Promise<string>;
     /**
-     * Run inference
+     * Run inference (auto-retries on a healthy worker if assigned one is dead)
      */
     runInference(modelId: string, inputs: Tensor[]): Promise<Tensor[]>;
     /**

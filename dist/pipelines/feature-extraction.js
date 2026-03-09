@@ -1,33 +1,43 @@
 /**
  * edgeFlow.js - Feature Extraction Pipeline
  *
- * Extract embeddings/features from text, images, or other data.
+ * Extract embeddings/features from text using sentence-transformer models.
  */
 import { EdgeFlowTensor } from '../core/tensor.js';
-import { createBasicTokenizer } from '../utils/tokenizer.js';
+import { Tokenizer } from '../utils/tokenizer.js';
+import { loadModelData } from '../utils/model-loader.js';
+import { loadModelFromBuffer, runInferenceNamed } from '../core/runtime.js';
 import { BasePipeline, registerPipeline, } from './base.js';
-/**
- * FeatureExtractionPipeline - Extract embeddings from text
- */
+// ============================================================================
+// Default Model (all-MiniLM-L6-v2, 384-dim sentence embeddings)
+// ============================================================================
+const DEFAULT_MODELS = {
+    model: 'https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx',
+    tokenizer: 'https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer.json',
+};
+const DEFAULT_EMBEDDING_DIM = 384;
 export class FeatureExtractionPipeline extends BasePipeline {
     tokenizer = null;
+    onnxModel = null;
     embeddingDim;
-    constructor(config, embeddingDim = 768) {
+    modelUrl;
+    tokenizerUrl;
+    constructor(config, embeddingDim = DEFAULT_EMBEDDING_DIM) {
         super(config);
         this.embeddingDim = embeddingDim;
+        this.modelUrl = config.model !== 'default' ? config.model : DEFAULT_MODELS.model;
+        this.tokenizerUrl = DEFAULT_MODELS.tokenizer;
     }
-    /**
-     * Initialize pipeline
-     */
     async initialize() {
         await super.initialize();
         if (!this.tokenizer) {
-            this.tokenizer = createBasicTokenizer();
+            this.tokenizer = await Tokenizer.fromUrl(this.tokenizerUrl);
+        }
+        if (!this.onnxModel) {
+            const modelData = await loadModelData(this.modelUrl, { cache: this.config.cache ?? true });
+            this.onnxModel = await loadModelFromBuffer(modelData);
         }
     }
-    /**
-     * Run feature extraction
-     */
     async run(input, options) {
         const isBatch = Array.isArray(input);
         const inputs = isBatch ? input : [input];
@@ -35,11 +45,8 @@ export class FeatureExtractionPipeline extends BasePipeline {
         const startTime = performance.now();
         const results = [];
         for (const text of inputs) {
-            // Preprocess
             const tensorInputs = await this.preprocess(text);
-            // Run inference
             const outputs = await this.runInference(tensorInputs);
-            // Postprocess
             const result = await this.postprocess(outputs, options);
             results.push(result);
         }
@@ -49,9 +56,6 @@ export class FeatureExtractionPipeline extends BasePipeline {
         }
         return isBatch ? results : results[0];
     }
-    /**
-     * Preprocess text input
-     */
     async preprocess(input) {
         const text = Array.isArray(input) ? input[0] : input;
         const encoded = this.tokenizer.encode(text, {
@@ -59,32 +63,19 @@ export class FeatureExtractionPipeline extends BasePipeline {
             padding: 'max_length',
             truncation: true,
         });
-        const inputIds = new EdgeFlowTensor(new Float32Array(encoded.inputIds), [1, encoded.inputIds.length], 'float32');
-        const attentionMask = new EdgeFlowTensor(new Float32Array(encoded.attentionMask), [1, encoded.attentionMask.length], 'float32');
-        return [inputIds, attentionMask];
+        const inputIds = new EdgeFlowTensor(BigInt64Array.from(encoded.inputIds.map(id => BigInt(id))), [1, encoded.inputIds.length], 'int64');
+        const attentionMask = new EdgeFlowTensor(BigInt64Array.from(encoded.attentionMask.map(m => BigInt(m))), [1, encoded.attentionMask.length], 'int64');
+        const tokenTypeIds = new EdgeFlowTensor(BigInt64Array.from(encoded.inputIds.map(() => BigInt(0))), [1, encoded.inputIds.length], 'int64');
+        return [inputIds, attentionMask, tokenTypeIds];
     }
-    /**
-     * Run model inference
-     */
     async runInference(inputs) {
-        // Generate mock embeddings for demo
-        // In production, this would call the actual model
-        const seqLen = inputs[0]?.shape[1] ?? 128;
-        const embeddings = new Float32Array(seqLen * this.embeddingDim);
-        // Generate deterministic pseudo-embeddings based on input
-        const inputData = inputs[0]?.toFloat32Array() ?? new Float32Array(0);
-        for (let i = 0; i < seqLen; i++) {
-            for (let j = 0; j < this.embeddingDim; j++) {
-                const inputVal = inputData[i] ?? 0;
-                embeddings[i * this.embeddingDim + j] =
-                    Math.sin(inputVal * (j + 1) * 0.01) * 0.1;
-            }
-        }
-        return [new EdgeFlowTensor(embeddings, [1, seqLen, this.embeddingDim], 'float32')];
+        const namedInputs = new Map();
+        namedInputs.set('input_ids', inputs[0]);
+        namedInputs.set('attention_mask', inputs[1]);
+        namedInputs.set('token_type_ids', inputs[2]);
+        const outputs = await runInferenceNamed(this.onnxModel, namedInputs);
+        return outputs;
     }
-    /**
-     * Postprocess model outputs
-     */
     async postprocess(outputs, options) {
         const hiddenStates = outputs[0];
         if (!hiddenStates) {
@@ -95,44 +86,32 @@ export class FeatureExtractionPipeline extends BasePipeline {
         let embeddings;
         switch (pooling) {
             case 'cls':
-                // Use first token (CLS) embedding
                 embeddings = this.extractCLSEmbedding(hiddenStates);
                 break;
             case 'max':
-                // Max pooling
                 embeddings = this.maxPooling(hiddenStates);
                 break;
             case 'none':
-                // Return all token embeddings (flattened)
                 embeddings = hiddenStates.toArray();
                 break;
             case 'mean':
             default:
-                // Mean pooling
                 embeddings = this.meanPooling(hiddenStates);
                 break;
         }
-        // Normalize if requested
         if (normalize) {
             embeddings = this.normalizeVector(embeddings);
         }
-        // Dimension reduction if requested
         if (options?.outputDim && options.outputDim < embeddings.length) {
             embeddings = embeddings.slice(0, options.outputDim);
         }
         return { embeddings };
     }
-    /**
-     * Extract CLS token embedding
-     */
     extractCLSEmbedding(hiddenStates) {
         const data = hiddenStates.toFloat32Array();
         const embeddingDim = hiddenStates.shape[2] ?? this.embeddingDim;
         return Array.from(data.slice(0, embeddingDim));
     }
-    /**
-     * Mean pooling over sequence
-     */
     meanPooling(hiddenStates) {
         const data = hiddenStates.toFloat32Array();
         const seqLen = hiddenStates.shape[1] ?? 1;
@@ -145,9 +124,6 @@ export class FeatureExtractionPipeline extends BasePipeline {
         }
         return Array.from(result);
     }
-    /**
-     * Max pooling over sequence
-     */
     maxPooling(hiddenStates) {
         const data = hiddenStates.toFloat32Array();
         const seqLen = hiddenStates.shape[1] ?? 1;
@@ -163,9 +139,6 @@ export class FeatureExtractionPipeline extends BasePipeline {
         }
         return result;
     }
-    /**
-     * L2 normalize vector
-     */
     normalizeVector(vec) {
         let norm = 0;
         for (const v of vec) {
@@ -180,9 +153,6 @@ export class FeatureExtractionPipeline extends BasePipeline {
 // ============================================================================
 // Factory Function
 // ============================================================================
-/**
- * Create feature extraction pipeline
- */
 export function createFeatureExtractionPipeline(config = {}) {
     return new FeatureExtractionPipeline({
         task: 'feature-extraction',
@@ -192,6 +162,5 @@ export function createFeatureExtractionPipeline(config = {}) {
         quantization: config.quantization,
     });
 }
-// Register pipeline
 registerPipeline('feature-extraction', (config) => new FeatureExtractionPipeline(config));
 //# sourceMappingURL=feature-extraction.js.map

@@ -115,8 +115,13 @@ export function deserializeTensorSync(
 // Worker Manager
 // ============================================================================
 
+export type WorkerHealthState = 'alive' | 'dead' | 'restarting';
+
+const MAX_RESTART_ATTEMPTS = 3;
+const RESTART_BASE_DELAY_MS = 1000;
+
 /**
- * InferenceWorker - Wrapper for a single Web Worker
+ * InferenceWorker - Wrapper for a single Web Worker with auto-restart
  */
 export class InferenceWorker {
   private worker: Worker | null = null;
@@ -127,8 +132,12 @@ export class InferenceWorker {
   private isReady = false;
   private readyPromise: Promise<void>;
   private readyResolve!: () => void;
+  private workerUrl: string | undefined;
+  private _health: WorkerHealthState = 'alive';
+  private restartAttempts = 0;
 
   constructor(workerUrl?: string) {
+    this.workerUrl = workerUrl;
     this.readyPromise = new Promise(resolve => {
       this.readyResolve = resolve;
     });
@@ -136,11 +145,14 @@ export class InferenceWorker {
     this.initWorker(workerUrl);
   }
 
+  get health(): WorkerHealthState {
+    return this._health;
+  }
+
   /**
    * Initialize the worker
    */
   private initWorker(workerUrl?: string): void {
-    // Create worker from blob if no URL provided
     const url = workerUrl ?? this.createWorkerBlob();
     
     this.worker = new Worker(url, { type: 'module' });
@@ -151,12 +163,70 @@ export class InferenceWorker {
     
     this.worker.onerror = (error) => {
       console.error('Worker error:', error);
-      // Reject all pending requests
-      for (const [, { reject }] of this.pendingRequests) {
-        reject(new Error('Worker error'));
-      }
-      this.pendingRequests.clear();
+      this.handleCrash();
     };
+
+    this.worker.onmessageerror = () => {
+      this.handleCrash();
+    };
+  }
+
+  /**
+   * Handle worker crash: reject pending, mark dead, attempt restart
+   */
+  private handleCrash(): void {
+    this._health = 'dead';
+    this.isReady = false;
+    
+    const crashError = new Error('Worker crashed');
+    for (const [, { reject }] of this.pendingRequests) {
+      reject(crashError);
+    }
+    this.pendingRequests.clear();
+
+    this.attemptRestart();
+  }
+
+  /**
+   * Restart the worker with exponential backoff
+   */
+  private attemptRestart(): void {
+    if (this.restartAttempts >= MAX_RESTART_ATTEMPTS) {
+      console.error(`Worker failed to restart after ${MAX_RESTART_ATTEMPTS} attempts`);
+      return;
+    }
+
+    this._health = 'restarting';
+    const delay = RESTART_BASE_DELAY_MS * Math.pow(2, this.restartAttempts);
+    this.restartAttempts++;
+
+    setTimeout(() => {
+      this.restart();
+    }, delay);
+  }
+
+  /**
+   * Restart: terminate old, create new
+   */
+  restart(): void {
+    if (this.worker) {
+      try { this.worker.terminate(); } catch { /* already dead */ }
+      this.worker = null;
+    }
+
+    this.readyPromise = new Promise(resolve => {
+      this.readyResolve = resolve;
+    });
+    this.isReady = false;
+
+    try {
+      this.initWorker(this.workerUrl);
+      this._health = 'alive';
+      this.restartAttempts = 0;
+    } catch {
+      this._health = 'dead';
+      this.attemptRestart();
+    }
   }
 
   /**
@@ -375,14 +445,17 @@ export class InferenceWorker {
 // ============================================================================
 
 /**
- * WorkerPool - Manage multiple workers for parallel inference
+ * WorkerPool - Manage multiple workers for parallel inference.
+ * Automatically falls back to healthy workers when one is dead.
  */
 export class WorkerPool {
   private workers: InferenceWorker[] = [];
   private currentIndex = 0;
   private modelAssignments: Map<string, number> = new Map();
+  private poolOptions: WorkerPoolOptions;
 
   constructor(options: WorkerPoolOptions = {}) {
+    this.poolOptions = options;
     const numWorkers = options.numWorkers ??
       (typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : 4) ?? 4;
     
@@ -392,23 +465,45 @@ export class WorkerPool {
   }
 
   /**
-   * Get next worker (round-robin)
+   * Get next healthy worker (round-robin, skipping dead ones)
    */
-  private getNextWorker(): InferenceWorker {
-    const worker = this.workers[this.currentIndex]!;
-    this.currentIndex = (this.currentIndex + 1) % this.workers.length;
+  private getNextHealthyWorker(): InferenceWorker {
+    const len = this.workers.length;
+    for (let attempt = 0; attempt < len; attempt++) {
+      const worker = this.workers[this.currentIndex]!;
+      this.currentIndex = (this.currentIndex + 1) % len;
+      if (worker.health === 'alive') return worker;
+    }
+    // All dead — try restarting first one and return it
+    const worker = this.workers[0]!;
+    if (worker.health === 'dead') worker.restart();
     return worker;
   }
 
   /**
-   * Get worker for a specific model
+   * Get worker for a specific model, falling back to any healthy worker
    */
   private getWorkerForModel(modelId: string): InferenceWorker {
     const index = this.modelAssignments.get(modelId);
     if (index !== undefined) {
-      return this.workers[index]!;
+      const worker = this.workers[index]!;
+      if (worker.health === 'alive') return worker;
+      // Assigned worker is dead — pick a healthy one and reassign
+      const replacement = this.getNextHealthyWorker();
+      this.modelAssignments.set(modelId, this.workers.indexOf(replacement));
+      return replacement;
     }
-    return this.getNextWorker();
+    return this.getNextHealthyWorker();
+  }
+
+  /**
+   * Replace a worker at a given index with a fresh one
+   */
+  replaceWorker(index: number): void {
+    if (index < 0 || index >= this.workers.length) return;
+    const old = this.workers[index]!;
+    old.terminate();
+    this.workers[index] = new InferenceWorker(this.poolOptions.workerUrl);
   }
 
   /**
@@ -425,14 +520,14 @@ export class WorkerPool {
     url: string,
     options?: { runtime?: RuntimeType; cache?: boolean }
   ): Promise<string> {
-    const worker = this.getNextWorker();
+    const worker = this.getNextHealthyWorker();
     const modelId = await worker.loadModel(url, options);
     this.modelAssignments.set(modelId, this.workers.indexOf(worker));
     return modelId;
   }
 
   /**
-   * Run inference
+   * Run inference (auto-retries on a healthy worker if assigned one is dead)
    */
   async runInference(modelId: string, inputs: Tensor[]): Promise<Tensor[]> {
     const worker = this.getWorkerForModel(modelId);
@@ -446,7 +541,6 @@ export class WorkerPool {
     modelId: string,
     batchInputs: Tensor[][]
   ): Promise<Tensor[][]> {
-    // Distribute across workers
     const results = await Promise.all(
       batchInputs.map((inputs, i) => {
         const worker = this.workers[i % this.workers.length]!;

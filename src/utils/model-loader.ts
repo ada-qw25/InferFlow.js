@@ -169,31 +169,91 @@ class ModelCache {
   }
 
   /**
-   * Save model metadata
+   * Save model metadata (with quota error handling)
    */
   async saveMeta(meta: CachedModelMeta): Promise<void> {
+    try {
+      await this.putInStore(STORE_META, meta);
+    } catch (err) {
+      if (this.isQuotaError(err)) {
+        await this.evictOldest(meta.size);
+        try {
+          await this.putInStore(STORE_META, meta);
+        } catch {
+          console.warn('[edgeFlow.js] IndexedDB quota exceeded even after eviction; skipping cache.');
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * Save a chunk (with quota error handling)
+   */
+  async saveChunk(url: string, index: number, data: ArrayBuffer): Promise<void> {
+    try {
+      await this.putInStore(STORE_CHUNKS, { url, index, data });
+    } catch (err) {
+      if (this.isQuotaError(err)) {
+        await this.evictOldest(data.byteLength);
+        try {
+          await this.putInStore(STORE_CHUNKS, { url, index, data });
+        } catch {
+          console.warn('[edgeFlow.js] IndexedDB quota exceeded even after eviction; skipping cache for chunk.');
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * Generic put helper
+   */
+  private async putInStore(storeName: string, value: unknown): Promise<void> {
     const db = await this.openDB();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_META, 'readwrite');
-      const store = tx.objectStore(STORE_META);
-      store.put(meta);
+      const tx = db.transaction(storeName, 'readwrite');
+      const store = tx.objectStore(storeName);
+      store.put(value);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
   }
 
   /**
-   * Save a chunk
+   * Detect IndexedDB quota exceeded errors
    */
-  async saveChunk(url: string, index: number, data: ArrayBuffer): Promise<void> {
+  private isQuotaError(err: unknown): boolean {
+    if (err instanceof DOMException) {
+      return err.name === 'QuotaExceededError' || err.code === 22;
+    }
+    return false;
+  }
+
+  /**
+   * Evict oldest cached models to free space.
+   * Deletes models by ascending `cachedAt` until at least `bytesNeeded` is freed.
+   */
+  async evictOldest(bytesNeeded: number): Promise<void> {
     const db = await this.openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_CHUNKS, 'readwrite');
-      const store = tx.objectStore(STORE_CHUNKS);
-      store.put({ url, index, data });
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+    const allMeta: CachedModelMeta[] = await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_META, 'readonly');
+      const store = tx.objectStore(STORE_META);
+      const request = store.getAll();
+      request.onsuccess = () => resolve(request.result ?? []);
+      request.onerror = () => reject(request.error);
     });
+
+    allMeta.sort((a, b) => a.cachedAt - b.cachedAt);
+
+    let freed = 0;
+    for (const meta of allMeta) {
+      if (freed >= bytesNeeded) break;
+      await this.deleteModel(meta.url);
+      freed += meta.size;
+    }
   }
 
   /**
@@ -241,17 +301,18 @@ class ModelCache {
   }
 
   /**
-   * Save download state (for resume)
+   * Save download state (for resume, with quota handling)
    */
   async saveDownloadState(state: DownloadState): Promise<void> {
-    const db = await this.openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_STATE, 'readwrite');
-      const store = tx.objectStore(STORE_STATE);
-      store.put(state);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
+    try {
+      await this.putInStore(STORE_STATE, state);
+    } catch (err) {
+      if (this.isQuotaError(err)) {
+        console.warn('[edgeFlow.js] IndexedDB quota exceeded saving download state; resume may not work.');
+      } else {
+        throw err;
+      }
+    }
   }
 
   /**
@@ -811,15 +872,25 @@ export async function loadModelData(
   if (cache && !forceDownload) {
     const cached = await modelCache.getModel(url);
     if (cached) {
-      console.log(`✓ Model loaded from cache: ${url}`);
-      options.onProgress?.({
-        loaded: cached.byteLength,
-        total: cached.byteLength,
-        percent: 100,
-        speed: 0,
-        eta: 0,
-      });
-      return cached;
+      // Validate: reject cached content that is clearly an HTTP error page
+      // (HTML starts with '<', JSON error starts with '{').  Valid ONNX
+      // protobuf binaries always have high-bit or control bytes first.
+      const firstByte = new Uint8Array(cached)[0];
+      const isHtmlOrText = firstByte === 0x3c /* '<' */ || firstByte === 0x7b /* '{' */;
+      if (isHtmlOrText || cached.byteLength < 1024) {
+        console.warn(`[edgeFlow.js] Cached model for ${url} appears corrupt (${cached.byteLength} bytes, first byte 0x${firstByte?.toString(16)}). Evicting and re-downloading.`);
+        await modelCache.deleteModel(url);
+      } else {
+        console.log(`✓ Model loaded from cache: ${url}`);
+        options.onProgress?.({
+          loaded: cached.byteLength,
+          total: cached.byteLength,
+          percent: 100,
+          speed: 0,
+          eta: 0,
+        });
+        return cached;
+      }
     }
   }
 
